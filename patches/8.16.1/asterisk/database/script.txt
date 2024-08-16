@@ -1,0 +1,13 @@
+ALTER TABLE sip_conf ADD COLUMN useragent character varying(100);
+
+UPDATE sip_conf
+SET md5secret = md5(concat(username, ':asterisk:', secret)), secret = ''
+WHERE md5secret IS NULL;
+
+UPDATE iax2_conf
+SET md5secret = md5(concat(username, ':asterisk:', secret)), secret = ''
+WHERE md5secret IS NULL;
+
+ALTER TABLE sip_conf ADD COLUMN realm varchar(100);
+
+ALTER TABLE iax2_conf ADD COLUMN realm varchar(100);

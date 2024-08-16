@@ -1,0 +1,48 @@
+#!/bin/bash
+#
+# flushramdisk	This shell script takes care of flushing ram disk files.
+#
+# chkconfig: - 58 74
+
+# Source function library.
+. /etc/init.d/functions
+
+prog=flushramdisk.sh
+exec=/usr/sbin/$prog
+lockfile=/var/lock/subsys/$prog
+
+start() {
+	if [ ! -x $exec ]; then
+		echo $exec not found or not executable
+		exit 5
+	fi
+	echo -n $"Starting $prog: "
+	#$exec
+	RETVAL=$?
+	echo
+	[ $RETVAL -eq 0 ] && touch $lockfile
+	return $RETVAL
+}
+
+stop() {
+	echo -n $"Shutting down $prog: "
+	$exec
+	#killproc $prog
+	RETVAL=$?
+	echo
+	[ $RETVAL -eq 0 ] && rm -f $lockfile
+	return $RETVAL
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  *)
+	echo $"Usage: $0 {start|stop}"
+	exit 2
+esac

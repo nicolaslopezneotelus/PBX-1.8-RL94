@@ -1,0 +1,1 @@
+ALTER TABLE sip_conf ADD COLUMN transport varchar(3) DEFAULT 'udp';

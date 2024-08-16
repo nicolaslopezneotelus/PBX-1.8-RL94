@@ -1,0 +1,18 @@
+;
+; Message Information file
+;
+[message]
+origmailbox=100009997
+context=internal
+macrocontext=
+exten=9997
+rdnis=unknown
+priority=1
+callerchan=SIP/wrtctest-00000046
+callerid="test test" <9998>
+origdate=Thu Dec  7 06:10:04 PM UTC 2023
+origtime=1701972604
+category=
+msg_id=1701972604-1068512716
+flag=
+duration=4

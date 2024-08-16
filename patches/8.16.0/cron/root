@@ -1,0 +1,7 @@
+*/10 * * * * vacuumdb --dbname asterisk --username postgres > /dev/null 2>&1
+0,30 * * * * vacuumdb --analyze --dbname asterisk --username postgres > /dev/null 2>&1
+0 1 * * * vacuumdb --full --dbname asterisk --username postgres > /dev/null 2>&1
+0 2 * * * /etc/asterisk/cleanfiles.sh > /dev/null 2>&1
+*/5 * * * * /etc/asterisk/movefiles.sh > /dev/null 2>&1
+0 3 * * * /etc/asterisk/backup.sh > /dev/null 2>&1
+30 2 * * * /etc/rc.d/init.d/asterisk restart > /dev/null 2>&1

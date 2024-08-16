@@ -1,0 +1,18 @@
+;
+; Message Information file
+;
+[message]
+origmailbox=100009997
+context=internal
+macrocontext=
+exten=9997
+rdnis=unknown
+priority=1
+callerchan=SIP/neotest-00000012
+callerid="test test" <9998>
+origdate=Fri Nov 10 09:23:16 PM UTC 2023
+origtime=1699651396
+category=
+msg_id=1699651396-1068512716
+flag=
+duration=44

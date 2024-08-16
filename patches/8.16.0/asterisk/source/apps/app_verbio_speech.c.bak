@@ -1,0 +1,6026 @@
+/*
+ * Asterisk -- An open source telephony toolkit.
+ *
+ * Copyright (C) <2011>, <Verbio Technologies>
+ *
+ * Verbio Technologies <support@verbio.com>
+ *
+ * See http://www.asterisk.org for more information about
+ * the Asterisk project. Please do not directly contact
+ * any of the maintainers of this project for assistance;
+ * the project provides a web site, mailing lists and IRC
+ * channels for your use.
+ *
+ * This program is free software, distributed under the terms of
+ * the GNU General Public License Version 2. See the LICENSE file
+ * at the top of the source tree.
+ */
+
+/*! \file
+ *
+ * \brief Verbio Technologies Speech Applications
+ *
+ * \author Verbio Technologies S.L <support@verbio.com>
+ *
+ * \ingroup applications
+ */
+
+#include "asterisk.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <ctype.h> /*toupper*/
+#include <errno.h>
+#include "sys/stat.h"
+
+ASTERISK_FILE_VERSION(__FILE__, "$Revision: 38 $")
+
+#include "asterisk/file.h"
+#include "asterisk/logger.h"
+#include "asterisk/channel.h"
+#include "asterisk/pbx.h"
+#include "asterisk/module.h"
+#include "asterisk/lock.h"
+#include "asterisk/app.h"
+#include "asterisk/version.h"
+
+/* Verbio voxlib */
+#include <voxlib.h>
+
+static const int 	VERBIO_BUFFER_SIZE 	= 8000;/* FIXME max 1s audio */
+static const int 	VERBIO_MAXINDEX 	= 320; /*32*/
+static const int 	VERBIO_MAX_RES_SIZE	= 100;
+static const int 	VERBIO_MAX_CVAR_SIZE	= 120;
+static const int 	VERBIO_MAX_INT_SIZE	= 10;
+static const int 	VERBIO_MAX_TSTR_SIZE	= 10;
+static const float 	VERBIO_MAX_REF		= 200.0;
+static const float 	VERBIO_MIN_REF		= 50.0;
+static const float	VERBIO_LOW_FACTOR	= 2.5;
+static const float	VERBIO_HIGH_FACTOR	= 4.5;
+static const float	VERBIO_FINAL_FACTOR	= 0.8;
+static const float	VERBIO_FINAL_HIGH_FACTOR= 2.5;
+static const float	VERBIO_MIN_HIGH_THRESH	= 500.0;
+static const float	VERBIO_AAM_MIN		= 50.0;
+static const float	VERBIO_AAM_MAX		= 200.0;
+static const float 	VSTD_FACTOR		= 2.0;
+static const float 	VN_FACTOR		= 5.0;
+static const float 	VH_FACTOR		= 7.0;
+static const char 	*VERBIO_CFG		= "verbio.conf";
+static const int	MAX_WAIT_TIME		= 1000; /*ms*/
+
+static const char	*VERBIO_GRM_CACHE_DIR	= "/.cache/";
+
+#define	VERBIO_DIR_MODE		0777
+#define	VERBIO_FILE_MODE	0644
+
+/* MC_ALAW, MC_MULAW, MC_LIN16 */
+/* AST_FORMAT_ALAW, AST_FORMAT_ULAW, AST_FORMAT_SLINEAR */
+#define	VERBIO_CODEC 		MC_ALAW
+#define AUDIO_FORMAT		AST_FORMAT_ALAW
+
+static const char 	*EXT			= "alaw";
+static const char 	*VERBIO_DEF_HOST	= "127.0.0.1";
+static const char 	*VERBIO_DEF_NET_TMOUT	= "5";
+static const char 	*VERBIO_TTS_INIT_DELAY	= "650";
+static const char 	*VERBIO_TTS_END_DELAY	= "80";
+static const char 	*VERBIO_INIT_SIL	= "300";
+static const char 	*VERBIO_MAX_SIL		= "200";
+static const char 	*VERBIO_DEF_ABS_TMOUT	= "30";
+
+#define VERBIO_DEF_REC_PATH	"/var/lib/asterisk/verbio/audio/"
+#define AST_4 			10400
+#define AST_6 			10600
+#define AST_601 		10601
+#define AST_8			10800
+
+#if ASTERISK_VERSION_NUM < AST_6 
+	#define args_sep '|'
+	#define str_sep "|"
+#else
+	#define args_sep ','
+	#define str_sep ","
+#endif 
+
+#if ASTERISK_VERSION_NUM < AST_8
+	typedef void* DATA_TYPE;
+#else
+	typedef const char* DATA_TYPE;	
+#endif
+
+/* If we detect a hangup, close current verbio device*/
+#define VERBIO_CLOSE_ON_HANGUP
+
+/* 
+* Application info
+*/
+/* VerbioPrompt */
+static char *verbio_prompt_descrip =
+"VerbioPrompt(text_or_file[|lang][|speaker][|options])\n"
+"Synthetise a text using Verbio TTS engine.\n"
+"- text_or_file: text or file (see options) to synth\n"
+"- lang        : tts language\n"
+"- speaker     : tts speaker\n"
+"- options     : v (verbosity on)\n"
+"                b (beep before prompt)\n"
+"                f (tread text_or_file parameter as a text file to read from)\n"
+//DELETED: 2010-05-03
+//"                p (enable pause/resume on dtmf -default key '#'. Use: p0,p1,..,p#,p* to specify a key, p. will enable all keys-)\n"
+//"                s (enable stop prompt on dtmf -default key '#'. Use: s0,s1,..,s#,s* to specify a key, s. will enable all keys-)\n"
+//DELETED: 2010-05-03
+//ADDED: 2010-05-03
+"                d (enable dtmf detection)\n"
+//ADDED: 2010-05-03
+"		 n (do not hangup on Verbio error)\n\n"
+//DELETED: 2010-05-03
+//"If stop prompt ('s' option) is enabled, the following channel vars will be set:\n"
+//" - VDTMF_DETECTED (TRUE -if user has pressed stop key- or FALSE)\n"
+//" - VDTMF_RESULT (if VDTMF_DETECTED = TRUE, will contain the pressed key -0,1,2,3,4,5,6,7,8,9,*,#-)\n"
+//"\n";
+//DELETED: 2010-05-03
+//ADDED: 2010-05-03
+"If dtmf detection ('d' option) is enabled, the following channel vars will be set:\n"
+" - VDTMF_DETECTED (TRUE or FALSE)\n"
+" - VDTMF_RESULT (if VDTMF_DETECTED = TRUE, will contain the pressed key -0,1,2,3,4,5,6,7,8,9,*,#...-)\n"
+"\n You are also allowed to set DTMF max length and DTMF terminator via the following dialplan variables:\n"
+"   - VERBIO_DTMF_MAXLEN\n"
+"   - VERBIO_DTMF_TERMINATOR\n\n";
+//ADDED: 2010-05-03
+static char *verbio_prompt_app = "VerbioPrompt";
+
+/* VerbioRec */
+static char *verbio_rec_descrip =
+"VerbioRec([|config][|lang][|initsil][|maxsil][|abs_timeout][|options])\n"
+"Launch a recognition.\n"
+"- config    : ASR config\n"
+"- lang      : ASR language \n"
+"- initsil   : Initial silence (max duration of initial silence 10ms units)\n"
+"- maxsil    : Max silence (max duration of final silence 10ms units)\n"
+"- abs_timeout    : Absolute timeout (seconds)\n"
+"- options   : v (verbosity on)\n"
+"              b (beep before recognition)\n"
+"              d (enable dtmf detection)\n"
+"	       n (do not hangup on Verbio error)\n\n"
+"You /must/ execute VerbioLoadVcb app prior to Launch any recognition.\n\n"
+"In order to check the recognition result, you need to check (once VerbioRec has finished) \n"
+"the following channel vars:\n"
+" - VASR_WORDS   : Number of recognized words (n).\n"
+" - VASR_INDEXn  : Index (in grammar) of the n-word recognized.\n"
+" - VASR_RESULTn : n-Result of recognition.\n"
+" - VASR_SCORE   : n-score of recognition.\n"
+" - VASR_UTTERANCEn  : n-utterance.\n"
+" - VASR_WEIGHT : n-weight\n"
+" - VASR_RULE   : n-rule \n\n"
+"For backward compatibility:\n"
+" - VASR_INDEX  =  VASR_INDEX0\n"
+" - VASR_RESULT =  VASR_RESULT0\n"
+" - VASR_SCORE  =  VASR_SCORE0\n"
+" - VASR_UTTERANCE  =  VASR_UTTERANCE0\n"
+" - VASR_WEIGHT  =  VASR_WEIGHT0\n"
+" - VASR_RULE  =  VASR_RULE0\n\n"
+"If dtmf detection ('d' option) is enabled, the following channel vars will be set:\n"
+" - VDTMF_DETECTED (TRUE or FALSE)\n"
+" - VDTMF_RESULT (if VDTMF_DETECTED = TRUE, will contain the pressed key -0,1,2,3,4,5,6,7,8,9,*,#...-)\n"
+"\n You are also allowed to set DTMF max length and DTMF terminator via the following dialplan variables:\n"
+"   - VERBIO_DTMF_MAXLEN\n"
+"   - VERBIO_DTMF_TERMINATOR\n\n"
+"Note: If 'keep_recorded_files' is enabled in 'verbio.conf', you can check the recorded file name via\n"
+"      VASR_REC_FILE dialplan variable (once the recognition application has finished).\n";
+static char *verbio_rec_app = "VerbioRec";
+
+/* VerbioPromptAndRec */
+static char *verbio_prompt_and_rec_descrip =
+"VerbioPromptAndRec(text_or_file[|initsil][|maxsil][|tts_lang][|tts_spkr][|asr_conf][|asr_lang][|abs_timeout][|options])\n"
+"VerbioPromptAndRec.\n"
+"- text_or_file: text or file (see options) to synth\n"
+"- initsil     : Initial silence (max duration of initial silence 10ms units)\n"
+"- maxsil      : Max silence (max duration of final silence 10ms units)\n"
+"- tts_lang    : TTS language\n"
+"- tts_spkr    : TTS speaker\n"
+"- asr_conf    : ASR config\n"
+"- asr_lang    : ASR language \n"
+"- abs_timeout : Absolute timeout (seconds)\n"
+"- options     : v (verbosity on)\n"
+"                f (tread text_or_file parameter as a text file to read from)\n"
+"                b (beep before rec -no sense when using bargein-)\n"
+"                g (bargein activated, user can interrupt the system -will disable beep-)\n"
+"                i (immediately stop tts on voice detection -will enable bargein-)\n"
+"                d (enable dtmf detection)\n"
+"	         n (do not hangup on Verbio error)\n\n"
+"Please, when using bargein, be very carefull with initsil and maxsil parameters. If you do not\n"
+"properly set them you may run into problems like recognition stopping\n"
+"(prior to finish) our prompt (if user does not speak). \n"
+"initsil must be high enough to allow the user to listen our (full) prompt.\n\n"
+"Also remember that you /must/ execute VerbioLoadVcb app prior to launch a recognition.\n\n"
+"In order to check the recognition result, you need to check (once VerbioPromptAndRec has finished) \n"
+"the following channel vars:\n"
+" - VASR_WORDS   : Number of recognized words (n).\n"
+" - VASR_INDEXn  : Index (in grammar) of the n-word recognized.\n"
+" - VASR_RESULTn : n-Result of recognition.\n"
+" - VASR_SCORE   : n-score of recognition.\n"
+" - VASR_UTTERANCEn  : n-utterance.\n"
+" - VASR_WEIGHT : n-weight\n"
+" - VASR_RULE   : n-rule \n\n"
+"For backward compatibility:\n"
+" - VASR_INDEX  =  VASR_INDEX0\n"
+" - VASR_RESULT =  VASR_RESULT0\n"
+" - VASR_SCORE  =  VASR_SCORE0\n"
+" - VASR_UTTERANCE  =  VASR_UTTERANCE0\n"
+" - VASR_WEIGHT  =  VASR_WEIGHT0\n"
+" - VASR_RULE  =  VASR_RULE0\n\n"
+"If dtmf detection ('d' option) is enabled, the following channel vars will be set:\n"
+" - VDTMF_DETECTED (TRUE or FALSE)\n"
+" - VDTMF_RESULT (if VDTMF_DETECTED = TRUE, will contain the pressed key -0,1,2,3,4,5,6,7,8,9,*,#...-)\n"
+"\n You are also allowed to set DTMF max length and DTMF terminator via the following dialplan variables:\n"
+"   - VERBIO_DTMF_MAXLEN\n"
+"   - VERBIO_DTMF_TERMINATOR\n\n"
+"Note: If 'keep_recorded_files' is enabled in 'verbio.conf', you can check the recorded file name via\n"
+"      VASR_REC_FILE dialplan variable (once the recognition application has finished).\n";
+static char *verbio_prompt_and_rec_app = "VerbioPromptAndRec";
+
+/* VerbioStreamAndRec */
+static char *verbio_stream_and_rec_descrip =
+"VerbioStreamAndRec(audio_file[|initsil][|maxsil][|asr_conf][|asr_lang][|abs_timeout][|options])\n"
+"VerbioStreamAndRec.\n"
+"- audio_file  : Audio file to stream.\n"
+"- initsil     : Initial silence (max duration of initial silence 10ms units)\n"
+"- maxsil      : Max silence (max duration of final silence 10ms units)\n"
+"- asr_conf    : ASR config\n"
+"- asr_lang    : ASR language \n"
+"- abs_timeout : Absolute timeout (seconds)\n"
+"- options     : v (verbosity on)\n"
+"                b (beep before rec -no sense when using bargein-)\n"
+"                g (bargein activated, user can interrupt the system -will disable beep-)\n"
+"                i (immediately stop stream on voice detection -will enable bargein-)\n"
+"                d (enable dtmf detection)\n"
+"	         n (do not hangup on Verbio error)\n\n"
+"Please, when using bargein, be very carefull with initsil and maxsil parameters. If you do not\n"
+"properly set them you may run into problems like recognition stopping\n"
+"(prior to finish) our audio file (if user does not speak). \n"
+"initsil must be high enough to allow the user to listen our (full) audio file.\n\n"
+"Also remember that you /must/ execute VerbioLoadVcb app prior to launch a recognition.\n\n"
+"In order to check the recognition result, you need to check (once VerbioPromptAndRec has finished) \n"
+"the following channel vars:\n"
+" - VASR_WORDS   : Number of recognized words (n).\n"
+" - VASR_INDEXn  : Index (in grammar) of the n-word recognized.\n"
+" - VASR_RESULTn : n-Result of recognition.\n"
+" - VASR_SCORE   : n-score of recognition.\n"
+" - VASR_UTTERANCEn  : n-utterance.\n"
+" - VASR_WEIGHT : n-weight\n"
+" - VASR_RULE   : n-rule \n\n"
+"For backward compatibility:\n"
+" - VASR_INDEX  =  VASR_INDEX0\n"
+" - VASR_RESULT =  VASR_RESULT0\n"
+" - VASR_SCORE  =  VASR_SCORE0\n"
+" - VASR_UTTERANCE  =  VASR_UTTERANCE0\n"
+" - VASR_WEIGHT  =  VASR_WEIGHT0\n"
+" - VASR_RULE  =  VASR_RULE0\n\n"
+"If dtmf detection ('d' option) is enabled, the following channel vars will be set:\n"
+" - VDTMF_DETECTED (TRUE or FALSE)\n"
+" - VDTMF_RESULT (if VDTMF_DETECTED = TRUE, will contain the pressed key -0,1,2,3,4,5,6,7,8,9,*,#...-)\n"
+"\n You are also allowed to set DTMF max length and DTMF terminator via the following dialplan variables:\n"
+"   - VERBIO_DTMF_MAXLEN\n"
+"   - VERBIO_DTMF_TERMINATOR\n\n"
+"Note: If 'keep_recorded_files' is enabled in 'verbio.conf', you can check the recorded file name via\n"
+"      VASR_REC_FILE dialplan variable (once the recognition application has finished).\n";
+static char *verbio_stream_and_rec_app = "VerbioStreamAndRec";
+
+/* VerbioLoadVcb */
+static char *verbio_load_vcb_descrip =
+"VerbioLoadVcb(gram_file|gram_type[|config][|lang][|options])\n"
+"Load vocabulary.\n"
+"- gram_file : grammar file\n"
+//DELETED: 2017-03-15
+//#if defined(__x86_64__)
+//"- gram_type : grammar type (ISOLATED, CONNECTED or ABNF)\n"
+//#else
+//DELETED: 2017-03-15
+"- gram_type : grammar type (ISOLATED, CONNECTED, ABNF, BUILTIN or VVI)\n"
+//DELETED: 2017-03-15
+//#endif
+//DELETED: 2017-03-15
+"- config    : ASR config\n"
+"- lang      : ASR language \n"
+"- options   : v (verbosity on)\n"
+"	       n (do not hangup on Verbio error)\n\n"
+"This function will set a channel var (VVCB_HANDLE) containing the id (vcb_handle)\n"
+"of the loaded vocabulary (see VerbioUnloadVcb to see why we need this handle).\n";
+
+static char *verbio_load_vcb_app = "VerbioLoadVcb";
+
+/* VerbioUnloadVcb */
+static char *verbio_unload_vcb_descrip =
+"VerbioUnloadVcb(vcb_handle[|config][|lang][|options])\n"
+"Unload vocabulary.\n"
+"- vcb_handle: vocabulary id to unload (-1 to unload all, and free licences)\n"
+"- config    : ASR config \n"
+"- lang      : ASR language \n"
+"- options   : v (verbosity on)\n"
+"	       n (do not hangup on Verbio error)\n\n"
+"Please do not forget to execute this app on hangup...otherwise you may run out of licences.\n";
+static char *verbio_unload_vcb_app = "VerbioUnloadVcb";
+
+/* VerbioInfo */
+static char *verbio_info_descrip =
+"VerbioInfo()\n"
+"Print Verbio-related info.\n\n"
+"Channel vars set by VerbioInfo:\n"
+"	- VTTS_SPEAKERS	: available tts speakers (format: 'id1:name1:gender1:age1:lang1;id2:name2:gender2:age2:lang2;')\n"
+"	- VASR_CONFIGS 	: available asr configurations.\n";
+static char *verbio_info_app = "VerbioInfo";
+
+/* VerbioLastErr */
+static char *verbio_last_err_descrip =
+"VerbioLastErr(var)\n"
+"Get Verbio last error.\n"
+" - var: channel var where to store last error message.\n\n"
+"You need to call Verbio apps using the 'n' option (in order to\n"
+"disable hangup on app error).\n\n"
+"Error codes:\n"
+"EVX_NOERROR	NO ERROR \n"
+"EVX_INVSETUP	Vox ERROR (Files may be corrupted. Check disk and repeat Vox Setup) \n"
+"EVX_NOMEM	OUT OF MEMORY. (Check memory leakages) \n"
+"EVX_VCBFILE	THE VOCABULARY FILE NAME IS NOT VALID. (Check the vocabulary file name and path writing permission) \n"
+"EVX_INVWORD	THE VOCABULARY CONTAINS AN INVALID WORD. (Check and correct invalid words) \n"
+"EVX_NOLICFILE	NO LICENSE FILE WAS FOUND. (Use Setup and CheckOut to obtain the Vox directory structure and the license file) \n"
+"EVX_INVLIC	THE LICENSE FILE IS NOT VALID. (Use CheckOut to obtain a valid license file) \n"
+"EVX_SYSTEM	SYSTEM ERROR (Check errno) \n"
+"EVX_NOLIBINIT	VOXLIB WAS NOT SUCCESSFULLY LOADED. (Call vox_libinit() before using any Vox function) \n"
+"EVX_NOLIC	NO LICENSE \n"
+"EVX_NOSETVCB	NO ACTIVE VOCABULARY. (Use vox_setvcb() to set the active vocabulary) \n"
+"EVX_NORECSTR	NO RECOGNITION. (Use vox_recstr() to init recognition) \n"
+"EVX_NOLINE	NO MORE LINES ARE AVAILABLE FOR THE SPECIFIED CHANNEL DEVICE \n"
+"EVX_BADPARM	INVALID PARAMETER IN FUNCTION CALL \n"
+"EVX_NOTIMP	NOT IMPLEMENTED \n"
+"EVX_NORECIND	NO RECIND OR NBEST. (Call vox_recind() before calling ATVOX_NIND()) \n"
+"EVX_INVFILE	INVALID FILENAME \n"
+"EVX_NETWORK	NETWORK ERROR \n"
+"EVX_DICFILE	THE DICTIONARY FILE NAME IS NOT VALID \n"
+"EVX_PARSER	ABNF PARSER ERROR \n"
+"EVX_INVVER 	THE VOXSERVER VERSION DOES NOT MATCH THE CLIENT VERSION \n"
+"EVX_UNKNOWN	Unknown error\n";
+static char *verbio_last_err_app = "VerbioLastErr";
+
+/* VerbioFreeChannel */
+static char *verbio_free_channel_descrip =
+"VerbioFreeChannel()\n"
+"Free Verbio resources (memory and licences).\n"
+" Please do not forget to run this application at the end of every call.\n";
+static char *verbio_free_channel_app = "VerbioFreeChannel";
+
+#if ASTERISK_VERSION_NUM < AST_4
+static char *tdesc = "Verbio Speech Technologies Applications";
+
+STANDARD_LOCAL_USER;
+LOCAL_USER_DECL;
+#endif
+
+static int voxserver_is_down = 0;
+static int trying_to_reconnect = 0;
+static int unloading_module = 0;
+
+ast_mutex_t voxdownlock;
+ast_mutex_t reconnectlock;
+ast_mutex_t unloadingmodlock;
+
+/* Helpler functions */
+static void close_verbio( void);
+static int init_verbio( void);
+
+/*! \brief Helper function. Copy file*/
+static int verbio_copy_file(char *infile, char *outfile)
+{
+	int ifd;
+	int ofd;
+	int res;
+	int len;
+	char buf[4096];
+
+	if(( ifd = open( infile, O_RDONLY)) < 0) 
+	{
+		/*ast_log( LOG_WARNING, "Unable to open %s in read-only mode.\n", infile);*/
+		ast_log(LOG_WARNING, "Unable to open %s in read-only mode: %s\n", infile, strerror(errno));
+		return -1;
+	}
+	if(( ofd = open( outfile, O_WRONLY | O_TRUNC | O_CREAT, VERBIO_FILE_MODE)) < 0) 
+	{
+		/*ast_log(LOG_WARNING, "Unable to open %s in write-only mode.\n", outfile);*/
+		ast_log(LOG_WARNING, "Unable to open %s in write-only mode: %s\n", outfile, strerror(errno));
+		close(ifd);
+		return -1;
+	}
+	do 
+	{
+		len = read(ifd, buf, sizeof(buf));
+		if (len < 0) 
+		{
+			/*ast_log( LOG_WARNING, "Read failed on %s.\n", infile);*/
+			ast_log(LOG_WARNING, "Read failed on %s: %s\n", infile, strerror(errno));
+			close( ifd);
+			close( ofd);
+			unlink( outfile);
+		}
+		if (len) 
+		{
+			res = write( ofd, buf, len);
+			if( errno == ENOMEM || errno == ENOSPC || res != len) 
+			{
+				/*ast_log( LOG_WARNING, "Write failed on %s (%d of %d).\n", outfile, res, len);*/
+				ast_log(LOG_WARNING, "Write failed on %s (%d of %d): %s\n", outfile, res, len, strerror(errno));
+				close( ifd);
+				close( ofd);
+				unlink( outfile);
+			}
+		}
+	} while( len);
+	close( ifd);
+	close( ofd);
+	return 0;
+}
+
+/*! \brief Load config */
+static struct ast_config* verbio_load_asterisk_config( void)
+{
+	#if ASTERISK_VERSION_NUM < AST_6 
+	return ast_config_load( VERBIO_CFG); 
+	#else
+	struct ast_flags config_flags = { CONFIG_FLAG_WITHCOMMENTS };
+	return ast_config_load( VERBIO_CFG, config_flags);
+	#endif 
+}
+
+/*! \brief Helper function. Check grammar existance in cache */
+static int verbio_md5_grammar_exists( char *gram_full_path, char *md5_gram_full_path, const char *lang, int verbosity)
+{
+	struct ast_config 	*vcfg = NULL;	
+	const char 		*vcfg_grammar_path	= NULL;
+
+	vcfg = verbio_load_asterisk_config();
+	
+	if( !vcfg) 
+	{
+		ast_log(LOG_ERROR, "Error opening configuration file %s\n", VERBIO_CFG);
+		return -1;
+	}
+
+	if( !(vcfg_grammar_path = ast_variable_retrieve(vcfg, "asr", "grammar_path"))) 
+	{
+		ast_log( LOG_ERROR, "Could not read grammar_path option from /etc/asterisk/verbio.conf. Please set it up.\n");
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+
+	char md5gram[33] = "";
+	FILE *fp;
+	long len;
+	char *buf;
+	size_t rres;
+	char md5gram_path[MAXPATHLEN];
+
+	strcpy(md5_gram_full_path, "");
+
+	fp = fopen( gram_full_path,"rb");
+	if( !fp)
+	{
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	
+	fseek( fp, 0, SEEK_END);
+	len = ftell( fp);
+	rewind( fp);
+	buf = (char*) malloc( sizeof(char) * (len + 1));
+	if( buf == NULL)
+	{
+		ast_log(LOG_ERROR, "allocating buffer.\n");
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+
+	rres = fread( buf,1,len,fp);
+	/*ast_log(LOG_NOTICE, "readed %u out of %ld bytes\n", rres, len);*/
+	if( rres != len)
+	{
+		ast_log(LOG_ERROR, "reading grammar file to buffer.\n");
+		if( buf)
+			free( buf);
+
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+
+	if( fp)
+		fclose( fp);
+
+	buf[len] = '\0';
+	ast_md5_hash(md5gram, buf);
+	md5gram[32] = '\0';
+	/*ast_log(LOG_NOTICE, "md5sum: (%s).\n", md5gram);*/
+
+	if( buf)
+		free( buf);
+
+	strcpy( md5gram_path, vcfg_grammar_path);
+	strcat( md5gram_path, VERBIO_GRM_CACHE_DIR);
+	struct stat st;
+	if( stat( md5gram_path, &st) != 0)
+	{
+		/* cache dir does not exists*/
+		if(mkdir( md5gram_path, VERBIO_DIR_MODE) && errno != EEXIST) 
+		{
+			ast_log(LOG_WARNING, "mkdir '%s' failed: %s\n", md5gram_path, strerror(errno));
+			ast_config_destroy( vcfg);
+			return -1;
+		}
+		
+	}
+
+	strcat( md5gram_path, md5gram);
+	strcat( md5gram_path, "_");
+	strcat( md5gram_path, lang);
+	
+	/* check if file exists in  vcfg_grammar_path */
+	if( access( md5gram_path, F_OK ) != -1 ) 
+	{
+    		/* file exists*/
+		strcpy(md5_gram_full_path, md5gram_path);
+		if( verbosity > 0)
+			ast_log(LOG_NOTICE, "Grammar %s exists in cache (%s).\n", gram_full_path, md5_gram_full_path);
+		
+		ast_config_destroy( vcfg);
+		return 1; 
+	}
+	else
+	{
+		/* Create cache file */
+		verbio_copy_file(gram_full_path, md5gram_path);
+		strcpy(md5_gram_full_path, md5gram_path);
+	}
+
+	ast_config_destroy( vcfg);
+	return 0;
+}
+
+/*! \brief Helper function called on connection lost */
+static void lost_conn_callback( const char *server)
+{
+	struct ast_config 	*vcfg;
+	int auto_reconnect	= 0;
+	
+	ast_mutex_lock(&voxdownlock);
+	voxserver_is_down = 1;
+	ast_mutex_unlock(&voxdownlock);
+	
+	ast_log( LOG_ERROR, "Connection with voxserver (%s) lost! \n", server);
+	
+	vcfg = verbio_load_asterisk_config();
+	
+	if( vcfg) 
+	{
+		if( ast_variable_retrieve( vcfg, "general", "auto_reconnect"))
+			auto_reconnect = 1;
+		
+		ast_config_destroy( vcfg);
+	}
+	
+	if( !auto_reconnect)
+		return;
+	
+	ast_log( LOG_NOTICE, "auto_reconnect enabled in config file. Trying to reestablish connection...\n");
+	
+	ast_mutex_lock(&reconnectlock);
+	trying_to_reconnect = 1;
+	ast_mutex_unlock(&reconnectlock);
+	
+	int i = 1;
+	int j = 0;
+	while( 1)
+	{
+		ast_mutex_lock(&unloadingmodlock);
+		if( unloading_module) 
+		{ ast_mutex_unlock(&unloadingmodlock); break;}
+		ast_mutex_unlock(&unloadingmodlock);
+		
+		if( init_verbio() < 0)
+		{
+			/*ast_log( LOG_NOTICE, "it does not connect\n");*/
+		}
+		else
+		{ 
+			close_verbio();
+			if( init_verbio() >= 0)
+			{
+				ast_log( LOG_NOTICE, "connection with voxserver reestablished.\n");
+				ast_mutex_lock(&voxdownlock);
+				voxserver_is_down = 0;
+				ast_mutex_unlock(&voxdownlock);
+				break;
+			}
+		}
+
+		
+		j = 0;
+		while( j < (30 * i))
+		{
+			sleep( 1); /*TODO: to config file*/
+			
+			ast_mutex_lock(&unloadingmodlock);
+			if( unloading_module)
+			{
+				ast_log( LOG_NOTICE, "unload_module called...aborting reconnection.\n");
+				ast_mutex_unlock(&unloadingmodlock);
+				break;
+			}
+			ast_mutex_unlock(&unloadingmodlock);
+			
+			++j;
+		}
+	
+		if( i < 121)
+			++i;
+	}
+	ast_mutex_lock(&reconnectlock);
+	trying_to_reconnect = 0;
+	ast_mutex_unlock(&reconnectlock);
+}
+
+/*! \brief Close connection with voxserver */
+static void close_verbio( void)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_mutex_unlock(&voxdownlock); 
+		return;
+	}
+	else
+	{
+		voxserver_is_down = 1;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	ast_log( LOG_NOTICE, "Closing Verbio voxlib.\n");
+	vox_libclose();
+	/*sleep( 2);*/
+}
+
+//ADDED: 2017-03-20
+static int check_verbio(const char *host, int port, int timeout)
+{
+	int s, flags, res;
+	struct pollfd pfds[1];
+	struct sockaddr_in addr_in;
+	struct hostent *hp;
+	struct ast_hostent ahp;
+
+	if (!(hp = ast_gethostbyname(host, &ahp))) {
+		ast_log(LOG_WARNING, "Unable to locate host '%s'\n", host);
+		return -1;
+	}
+	if ((s = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+		ast_log(LOG_WARNING, "Unable to create socket: %s\n", strerror(errno));
+		return -1;
+	}
+	if ((flags = fcntl(s, F_GETFL)) < 0) {
+		ast_log(LOG_WARNING, "Fcntl(F_GETFL) failed: %s\n", strerror(errno));
+		close(s);
+		return -1;
+	}
+	if (fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) {
+		ast_log(LOG_WARNING, "Fnctl(F_SETFL) failed: %s\n", strerror(errno));
+		close(s);
+		return -1;
+	}
+	memset(&addr_in, 0, sizeof(addr_in));
+	addr_in.sin_family = AF_INET;
+	addr_in.sin_port = htons(port);
+	memcpy(&addr_in.sin_addr, hp->h_addr, sizeof(addr_in.sin_addr));
+	if (connect(s, (struct sockaddr *)&addr_in, sizeof(addr_in)) && (errno != EINPROGRESS)) {
+		ast_log(LOG_WARNING, "Connect failed with unexpected error: %s\n", strerror(errno));
+		close(s);
+		return -1;
+	}
+
+	pfds[0].fd = s;
+	pfds[0].events = POLLOUT;
+	while ((res = ast_poll(pfds, 1, 1000 * timeout)) != 1) {
+		if (errno != EINTR) {
+			if (!res) {
+				ast_log(LOG_WARNING, "Verbio connection to '%s:%d' timed out after timeout (%d) milliseconds.\n", host, port, 1000 * timeout);
+			} else
+				ast_log(LOG_WARNING, "Connect to '%s:%d' failed: %s\n", host, port, strerror(errno));
+			close(s);
+			return -1;
+		}
+	}
+
+	ast_verb(2, "Wow, connected! %d\n", s);
+	close(s);
+	return 0;
+}
+//ADDED: 2017-03-20
+
+/*! \brief Connect to verbio engine */
+static int init_verbio( void)
+{
+	/*
+		Return values:
+			-1 - Something went wrong
+			 0 - ASR and TTS
+			 1 - ASR
+			 2 - TTS
+	*/
+
+	/* Vars to store cfg file options*/
+	struct ast_config 	*vcfg;	
+	const char 		*vcfg_primary_host = NULL;
+	const char 		*vcfg_backup_host = NULL;
+	const char 		*vcfg_net_timeout = NULL;
+	const char 		*vcfg_default_asr_config = NULL;
+	const char 		*vcfg_default_asr_lang = NULL;
+	const char 		*vcfg_default_tts_lang = NULL;
+	const char 		*vcfg_default_tts_spkr = NULL;
+	/* ASR, TTS availability */
+	int			asr = 0;
+	int			tts = 0;
+	const unsigned int	retries = 10;/*TODO: to config file*/
+	unsigned int		done = 0;
+	unsigned int		count = 0;
+	
+	/* ----------------------------------------------- */
+	/* ----- Get options from Verbio config file ----- */
+	/* ----------------------------------------------- */
+	vcfg = verbio_load_asterisk_config();
+	
+	if( !vcfg) 
+	{
+		ast_log(LOG_ERROR, "Error opening configuration file %s\n", VERBIO_CFG);
+		return -1;
+	}
+	if( !( vcfg_primary_host = ast_variable_retrieve(vcfg, "general", "primary_vox_server"))) 
+		vcfg_primary_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_backup_host = ast_variable_retrieve(vcfg, "general", "backup_vox_server"))) 	
+		vcfg_backup_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_net_timeout = ast_variable_retrieve(vcfg, "general", "net_timeout"))) 
+		vcfg_net_timeout = VERBIO_DEF_NET_TMOUT;
+
+	if( !( vcfg_default_asr_config = ast_variable_retrieve(vcfg, "asr", "default_config"))) 
+		ast_log( LOG_WARNING, "ASR 'default_config' option missing...ASR will not be available.\n");
+
+	if( !( vcfg_default_asr_lang = ast_variable_retrieve(vcfg, "asr", "default_language"))) 
+		ast_log( LOG_WARNING, "ASR 'default_language' option missing...ASR will not be available.\n");
+		
+	if( !( vcfg_default_tts_lang = ast_variable_retrieve( vcfg, "tts", "default_language"))) 
+		ast_log( LOG_WARNING, "TTS 'default_language' option missing...TTS will not be available.\n");
+	
+	if( !( vcfg_default_tts_spkr = ast_variable_retrieve( vcfg, "tts", "default_speaker"))) 
+		ast_log( LOG_WARNING, "TTS default_speaker missing.\n");
+
+	/* If we perform a 'restart now' from CLI unload_module won't get called.
+	   We need to disconnect prior to reconnect to verbio voxserver.
+	*/
+	/*vox_libclose();*/
+	/*close_verbio();*/
+	sleep( 1);/*Avoid "fast" reconnections on "restart now"*/
+
+	/* ---------------------------- */
+	/* ----- Verbio Init stuff ---- */
+	/* ---------------------------- */
+	/* Connect on load_module...we avoid reconnections.
+	   Vox server periodically sends messages to clients.
+	*/
+	/* Set primary vox server ip*/
+	vox_setparm( -1, VXGB_DEFSERVER, vcfg_primary_host);
+	/* Set timeout */
+	vox_setparm( -1, VXGB_NETTIMEOUT, vcfg_net_timeout);
+	
+ 	/* Init VOX library */
+	/* Try to init ASR*/
+	if( vcfg_default_asr_config && vcfg_default_asr_lang)
+	{
+		asr = done = count = 0;
+		ast_log( LOG_NOTICE, "Starting ASR engine [conf:%s, lang:%s]\n", vcfg_default_asr_config, vcfg_default_asr_lang);
+		while( (count < retries) && (done == 0))
+		{
+			ast_mutex_lock(&unloadingmodlock);
+			if( unloading_module)
+			{ ast_mutex_unlock(&unloadingmodlock); break;}
+			ast_mutex_unlock(&unloadingmodlock);
+
+			sleep( 1);
+//ADDED: 2017-03-20
+			if (check_verbio(vcfg_primary_host, 8765, atoi(vcfg_net_timeout)) < 0) {
+				if (check_verbio(vcfg_backup_host, 8765, atoi(vcfg_net_timeout)) < 0) {
+					asr = 0;
+					break;
+				}
+			}
+//ADDED: 2017-03-20
+			if( vox_asr_init( vcfg_default_asr_config, vcfg_default_asr_lang) == -1) 
+			{
+				/*failed...try to connect to backup voxserver*/
+				vox_setparm( -1, VXGB_DEFSERVER, vcfg_backup_host);
+				if( vox_asr_init( vcfg_default_asr_config, vcfg_default_asr_lang) == -1) 
+					asr = 0;
+				else
+					asr = done = 1;
+			}
+			else
+			{
+				asr = done = 1;
+			}
+			++count;
+		}
+		if( done == 1)
+			ast_log( LOG_NOTICE, "success starting ASR engine\n");
+		else /*count == retries*/
+			ast_log( LOG_ERROR, "Can not init ASR (tried primary [%s] and backup [%s] hosts) %s\n", vcfg_primary_host, vcfg_backup_host, ATVOX_ERRMSGP( -1));
+	}
+	
+	/*if( vcfg_default_asr_config && vcfg_default_asr_lang && !done)*/
+	
+	/* Init VOX library */
+	/* Try to init TTS */
+	if( vcfg_default_tts_lang)
+	{
+		tts = done = count = 0;
+		ast_log( LOG_NOTICE, "Starting TTS engine [lang:%s]\n", vcfg_default_tts_lang);
+		while( (count < retries) && (done == 0))
+		{
+			ast_mutex_lock(&unloadingmodlock);
+			if( unloading_module)
+			{ ast_mutex_unlock(&unloadingmodlock); break;}
+			ast_mutex_unlock(&unloadingmodlock);
+			
+			sleep( 1);
+//ADDED: 2017-03-20
+			if (check_verbio(vcfg_primary_host, 8765, atoi(vcfg_net_timeout)) < 0) {
+				if (check_verbio(vcfg_backup_host, 8765, atoi(vcfg_net_timeout)) < 0) {
+					tts = 0;
+					break;
+				}
+			}
+//ADDED: 2017-03-20
+			if( vox_tts_init( NULL, vcfg_default_tts_lang) == -1) 
+			{
+				/*failed...try to connect to backup voxserver*/
+				vox_setparm( -1, VXGB_DEFSERVER, vcfg_backup_host);
+				if( vox_tts_init( NULL, vcfg_default_tts_lang) == -1) 
+					tts = 0;
+				else
+					tts = done = 1;
+			}
+			else
+			{
+				tts = done = 1;
+			}
+			++count;
+		}
+		if( done == 1)
+			ast_log( LOG_NOTICE, "success starting TTS engine\n");
+		else /* count == retries */
+			ast_log( LOG_ERROR, "Can not init TTS (tried primary [%s] and backup [%s] hosts) %s\n", vcfg_primary_host, vcfg_backup_host, ATVOX_ERRMSGP( -1));
+	}
+	if( asr || tts)
+	{
+		ast_mutex_lock(&voxdownlock);
+		voxserver_is_down = 0;
+		ast_mutex_unlock(&voxdownlock);
+		vox_regsrvclose( lost_conn_callback);
+	}
+
+#if 0
+	0 - ASR and TTS
+	1 - ASR
+	2 - TTS
+#endif
+	ast_config_destroy( vcfg);
+	
+	if( asr && tts)
+		return 0;
+	else if( asr)
+		return 1;
+	else if( tts)
+		return 2;
+	else
+		return -1;
+}
+
+/*! \brief Helper function. Gets a valid id to be used as Verbio device 'dev'*/
+static int verbio_get_dev( struct ast_channel *chan, int verbose)
+{
+	int dev = 0;
+	char tmpdev[100];
+	
+	/*This one, does not work when we have two concurrent 
+	  -less than a second- calls
+	  FIXME beware of 'systemname' option - asterisk.conf/asterisk 1.4 
+	  (if set) We may get dev = 0 ...uniqid(1.4)='systemname-uniqid'
+	  If we do not use chan->uniqueid.. this systemname option does not 
+	  affect us (sure??)
+	*/
+	/*dev = atoi( chan->uniqueid);*/ 
+
+	/* 
+		Incremental index (number after dot (.) in 'uniqueid')
+		FIXME: when this index gets reset? 
+	*/
+	if( verbose)
+		ast_log( LOG_NOTICE, "chan->uniqueid: %s\n", chan->uniqueid);
+
+	strcpy( tmpdev, chan->uniqueid);
+	char *dec = strrchr( tmpdev,'.');
+	dev = atoi( dec + 1);
+
+	/* avoid negative devs..It's possible to have a negative value here?*/
+	if( dev < 0)
+		dev = -dev;
+
+	if( verbose)
+		ast_log( LOG_NOTICE, "dev: %d\n", dev);
+
+	return dev;
+}
+
+/*!\brief Helper function. Set last verbio error as a channel variable 'var'.*/
+static void verbio_set_err( struct ast_channel *chan, int dev, const char *var)
+{
+	char *err_msg;
+	long err_code;
+	
+	/*Get last verbio error*/
+	err_code = ATVOX_LASTERR( dev);
+	
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		err_code = EVX_NETWORK;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	/*
+	long   VERBIOAPI ATVOX_LASTERR(int dev);
+	const char* VERBIOAPI ATVOX_ERRMSGP(int dev);
+	
+	 - :: Verbio error codes :: - 
+	 (check voxlib.h header file for more info)
+
+	 EVX_NOERROR        0	 NO ERROR 
+	 EVX_INVSETUP     - 4	 Vox ERROR 
+	 EVX_NOMEM        - 5	 OUT OF MEMORY.
+	 EVX_VCBFILE      - 6	 THE VOCABULARY FILE NAME IS NOT VALID.
+	 EVX_INVWORD      - 7	 THE VOCABULARY CONTAINS AN INVALID WORD.
+	 EVX_NOLICFILE    - 8	 NO LICENSE FILE WAS FOUND. 
+	 EVX_INVLIC       - 9	 THE LICENSE FILE IS NOT VALID. 
+	 EVX_SYSTEM       -10	 SYSTEM ERROR (Check errno) 
+	 EVX_NOLIBINIT    -13	 VOXLIB WAS NOT SUCCESSFULLY LOADED. 
+	 EVX_NOLIC        -14	 NO LICENSE 
+	 EVX_NOSETVCB     -15	 NO ACTIVE VOCABULARY. 
+	 EVX_NORECSTR     -16	 NO RECOGNITION. 
+	 EVX_NOLINE       -17	 NO LINES AVAILABLE FOR SPECIFIED CHAN DEVICE. 
+	 EVX_BADPARM      -18	 INVALID PARAMETER IN FUNCTION CALL 
+	 EVX_NOTIMP       -19	 NOT IMPLEMENTED 
+	 EVX_NORECIND     -20	 NO RECIND OR NBEST. 
+	 EVX_INVFILE      -21	 INVALID FILENAME 
+	 EVX_NETWORK      -22	 NETWORK ERROR 
+	 EVX_DICFILE      -23	 THE DICTIONARY FILE NAME IS NOT VALID 
+	 EVX_PARSER       -24	 ABNF PARSER ERROR 
+	 EVX_INVVER       -25	 CLIENT SERVER VERSION MISMATCH
+	*/
+
+	switch( err_code)
+    	{
+    	case 0:
+	err_msg = "EVX_NOERROR";
+        	break;
+    	case -4:
+	err_msg = "EVX_INVSETUP";
+        	break;
+    	case -5:
+        err_msg = "EVX_NOMEM";
+        	break;
+    	case -6: 
+       	err_msg = "EVX_VCBFILE";
+        	break;
+    	case -7: 
+       	err_msg = "EVX_INVWORD";
+        	break;
+    	case -8: 
+       	err_msg = "EVX_NOLICFILE";
+        	break;
+    	case -9: 
+       	err_msg = "EVX_INVLIC";
+        	break;
+    	case -10: 
+       	err_msg = "EVX_SYSTEM";
+        	break;
+    	case -13: 
+       	err_msg = "EVX_NOLIBINIT";
+        	break;
+    	case -14: 
+       	err_msg = "EVX_NOLIC";
+        	break;
+    	case -15: 
+       	err_msg = "EVX_NOSETVCB";
+        	break;
+    	case -16: 
+       	err_msg = "EVX_NORECSTR";
+        	break;
+    	case -17: 
+       	err_msg = "EVX_NOLINE";
+        	break;
+    	case -18: 
+       	err_msg = "EVX_BADPARM";
+        	break;
+    	case -19: 
+       	err_msg = "EVX_NOTIMP";
+        	break;
+    	case -20: 
+       	err_msg = "EVX_NORECIND";
+        	break;
+    	case -21: 
+       	err_msg = "EVX_INVFILE";
+        	break;
+    	case -22: 
+       	err_msg = "EVX_NETWORK";
+        	break;
+    	case -23: 
+       	err_msg = "EVX_DICFILE";
+        	break;
+    	case -24: 
+       	err_msg = "EVX_PARSER";
+        	break;
+    	case -25: 
+       	err_msg = "EVX_INVVER";
+        	break;
+    	default: err_msg = "EVX_UNKNOWN";
+    	}
+	
+	pbx_builtin_setvar_helper( chan, var, err_msg);
+}
+
+static void verbio_remove_h( char *c)
+{
+	unsigned int x;
+	if( c[0] == '[')
+		for( x = 0; x < strlen( c)-1; x++) /* Remove first 3 chars '[H]'*/
+			*(c+x) = *(c+x+3);
+}
+
+/*! \brief Helper function. Sets recognition result on Asterisk's dialplan (as channel var)*/
+static int verbio_set_asr_result( struct ast_channel *chan, int dev)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	/* 
+		This function will get the recognition (launched on 
+		Verbio 'dev' channel) result from voxserver, and set
+		it back to asterisk dialplan (as channel vars). 
+	*/
+	int 	nind = 0;
+	ssize_t index[VERBIO_MAXINDEX+1];
+	float 	score[VERBIO_MAXINDEX+1];
+	char 	tmpbuff[VERBIO_MAX_RES_SIZE];
+	char 	vtmpbuff[VERBIO_MAX_CVAR_SIZE];
+	char 	itmpbuff[VERBIO_MAX_INT_SIZE];
+	/*int 	size 	= 0;*/
+	int 	i 	= 0;
+	int 	scr 	= 0;
+	
+	/* -------------------------------------- */
+	/* ----- Get result from recognizer ----- */
+	/* -------------------------------------- */
+	if(( nind = vox_recind( dev, VERBIO_MAXINDEX, index, score, 0)) < 0)
+		ast_log( LOG_ERROR, "vox_recind %s\n", ATVOX_ERRMSGP( dev));
+
+	/* ------------------------------------- */
+	/* ----- Set Asterisk Channel vars ----- */
+	/* ------------------------------------- */
+	/* Number of recognized words */
+	if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%d",  nind) > VERBIO_MAX_RES_SIZE)
+		ast_log( LOG_WARNING, "Number of recognized words may be truncated.\n");
+	pbx_builtin_setvar_helper( chan, "VASR_WORDS", tmpbuff);
+
+	/* Backward compatibility*/
+	/*Index*/
+	if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%zd",  index[0]) > VERBIO_MAX_RES_SIZE)
+		ast_log( LOG_WARNING, "Index may be truncated.\n"); 
+	pbx_builtin_setvar_helper( chan, "VASR_INDEX", tmpbuff);
+
+	/*Result*/
+	if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_word(dev, index[0])) > VERBIO_MAX_RES_SIZE)
+		ast_log( LOG_WARNING, "Result may be truncated.\n"); 
+	pbx_builtin_setvar_helper( chan, "VASR_RESULT", tmpbuff);
+	
+	
+	/*Utterance*/
+	if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[0], 1)) > VERBIO_MAX_RES_SIZE)
+		ast_log( LOG_WARNING, "Utterance may be truncated.\n"); 
+	verbio_remove_h( tmpbuff);
+	if( strlen( tmpbuff) > 0)
+		pbx_builtin_setvar_helper( chan, "VASR_UTTERANCE", tmpbuff);
+	
+	/*Weight*/
+	if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[0], 2)) > VERBIO_MAX_RES_SIZE)
+		ast_log( LOG_WARNING, "Weight may be truncated.\n"); 
+	pbx_builtin_setvar_helper( chan, "VASR_WEIGHT", tmpbuff);
+
+	/*Rule*/
+	if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[0], 3)) > VERBIO_MAX_RES_SIZE)
+		ast_log( LOG_WARNING, "Rule may be truncated.\n"); 
+	pbx_builtin_setvar_helper( chan, "VASR_RULE", tmpbuff);
+
+	/*score*/
+	scr = (int)score[0];
+	if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%d",  scr) > VERBIO_MAX_RES_SIZE)
+		ast_log( LOG_WARNING, "Score may be truncated.\n"); 	
+	pbx_builtin_setvar_helper( chan, "VASR_SCORE", tmpbuff);
+
+	if( nind == 0) 
+	{
+		/* No words recognized */
+		
+		/*Index*/
+		if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%zd",  index[0]) > VERBIO_MAX_RES_SIZE)
+			ast_log( LOG_WARNING, "Index may be truncated.\n");
+		pbx_builtin_setvar_helper( chan, "VASR_INDEX0", tmpbuff);
+	
+		/*Result*/
+		if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_word(dev, index[0])) > VERBIO_MAX_RES_SIZE)
+			ast_log( LOG_WARNING, "Result may be truncated.\n"); 
+		pbx_builtin_setvar_helper( chan, "VASR_RESULT0", tmpbuff);
+		
+		/*Utterance*/
+		if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[0], 1)) > VERBIO_MAX_RES_SIZE)
+			ast_log( LOG_WARNING, "Utterance may be truncated.\n"); 
+		verbio_remove_h( tmpbuff);
+		if( strlen( tmpbuff) > 0)
+			pbx_builtin_setvar_helper( chan, "VASR_UTTERANCE0", tmpbuff);
+		
+		/*Weight*/
+		if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[0], 2)) > VERBIO_MAX_RES_SIZE)
+			ast_log( LOG_WARNING, "Weight may be truncated.\n"); 
+		pbx_builtin_setvar_helper( chan, "VASR_WEIGHT0", tmpbuff);
+
+		/*Rule*/
+		if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[0], 3)) > VERBIO_MAX_RES_SIZE)
+			ast_log( LOG_WARNING, "Rule may be truncated.\n"); 
+		pbx_builtin_setvar_helper( chan, "VASR_RULE0", tmpbuff);
+
+		/*score*/
+		pbx_builtin_setvar_helper( chan, "VASR_SCORE0", "0");
+	}
+	else 
+	{	/* for each recognized word...*/
+		for( i = 0; i < nind; i++) 
+		{
+			/* convert our index to a char */
+			if( snprintf( itmpbuff, VERBIO_MAX_INT_SIZE, "%d",  i) > VERBIO_MAX_INT_SIZE)
+				ast_log( LOG_WARNING, "Number of recognized words may be truncated.\n");
+
+			/*create our var names (to be set in Ast. Dialplan)*/
+			/* Index  */
+			strcpy(vtmpbuff, "VASR_INDEX");
+			strcat(vtmpbuff, itmpbuff);
+			/* Set value */
+			if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%zd",  index[i]) > VERBIO_MAX_RES_SIZE)
+				ast_log( LOG_WARNING, "Index may be truncated.\n");
+			pbx_builtin_setvar_helper( chan, vtmpbuff, tmpbuff);
+			
+			/*Result*/
+			strcpy(vtmpbuff, "VASR_RESULT");
+			strcat(vtmpbuff, itmpbuff);
+			if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_word(dev, index[i])) > VERBIO_MAX_RES_SIZE)
+				ast_log( LOG_WARNING, "Result may be truncated.\n"); 
+			pbx_builtin_setvar_helper( chan, vtmpbuff, tmpbuff);
+			
+			/*Utterance*/
+			strcpy(vtmpbuff, "VASR_UTTERANCE");
+			strcat(vtmpbuff, itmpbuff);
+			if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[i], 1)) > VERBIO_MAX_RES_SIZE)
+				ast_log( LOG_WARNING, "Utterance may be truncated.\n"); 
+			verbio_remove_h( tmpbuff);
+			if( strlen( tmpbuff) > 0)
+				pbx_builtin_setvar_helper( chan, vtmpbuff, tmpbuff);
+
+			/*Weight*/
+			strcpy(vtmpbuff, "VASR_WEIGHT");
+			strcat(vtmpbuff, itmpbuff);
+			if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[0], 2)) > VERBIO_MAX_RES_SIZE)
+				ast_log( LOG_WARNING, "Weight may be truncated.\n"); 
+			pbx_builtin_setvar_helper( chan, vtmpbuff, tmpbuff);
+	
+			/*Rule*/
+			strcpy(vtmpbuff, "VASR_RULE");
+			strcat(vtmpbuff, itmpbuff);
+			if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%s", vox_wordex(dev, index[0], 3)) > VERBIO_MAX_RES_SIZE)
+				ast_log( LOG_WARNING, "Rule may be truncated.\n"); 
+			pbx_builtin_setvar_helper( chan, vtmpbuff, tmpbuff);
+			
+			/*score*/
+			strcpy(vtmpbuff, "VASR_SCORE");
+			strcat(vtmpbuff, itmpbuff);
+			scr = (int)score[i];
+			if( snprintf( tmpbuff, VERBIO_MAX_RES_SIZE, "%d",  scr) > VERBIO_MAX_RES_SIZE)
+				ast_log( LOG_WARNING, "Score may be truncated.\n");
+			pbx_builtin_setvar_helper( chan, vtmpbuff, tmpbuff);
+		}
+	}
+	return 0;
+}
+
+/*! \brief Helper function. Set dtmf detection result (as channel var)*/
+static void verbio_set_dtmf_result( struct ast_channel *chan, int subclass)
+{
+	char 	tmpbuff[VERBIO_MAX_RES_SIZE];
+	char 	tmp[VERBIO_MAX_RES_SIZE];
+	
+	ast_log(LOG_NOTICE, "Pressed %c\n", subclass);
+
+	/* Set result */
+	pbx_builtin_setvar_helper( chan, "VDTMF_DETECTED", "TRUE");
+	if( snprintf( tmp, VERBIO_MAX_RES_SIZE, "%c", subclass) > VERBIO_MAX_RES_SIZE) /*FIXME: only 1 char...tmpbuff too big*/
+		ast_log( LOG_WARNING, "DTMF may be truncated.\n"); 
+
+	/* Check if user already pressed a dtmf */
+	const char *d = pbx_builtin_getvar_helper( chan, "VDTMF_RESULT");
+	if( !ast_strlen_zero( d))
+	{
+		strcpy( tmpbuff, d);
+		pbx_builtin_setvar_helper( chan, "VDTMF_RESULT", strcat( tmpbuff, tmp));
+	}
+	else
+	{
+		pbx_builtin_setvar_helper( chan, "VDTMF_RESULT", tmp);
+	}
+}
+
+/*! \brief Helper function. Reset dtmf detection channel var*/
+static void verbio_reset_dtmf_result( struct ast_channel *chan)
+{
+	pbx_builtin_setvar_helper( chan, "VDTMF_DETECTED", "FALSE");
+	pbx_builtin_setvar_helper( chan, "VDTMF_RESULT", NULL);
+}
+
+/* Verbio Apps */
+/*! \brief Text to speech application. */
+static int verbio_prompt( struct ast_channel *chan, DATA_TYPE data)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 			localuser *u;
+	#else
+	struct 			ast_module_user *u;
+	#endif
+	/* Input options */
+	char 			*options=NULL;
+	char 			*text_or_file = NULL;
+	char 			*args;
+	int 			argc = 0;
+	char			*argv[2];
+	char			*opt;
+//DELETED: 2010-05-03
+//	char			stop_key = '#';
+//	char			pause_key = '#';
+//DELETED: 2010-05-03
+	/*--*/
+	int 			option_answer = 0;
+	int 			option_beep  = 0;
+	int 			option_no_hangup_on_verbio_err = 0;
+	int 			option_asfile = 0;
+//DELETED: 2010-05-03
+//	int			option_enable_pause = 0;
+//	int			option_enable_stop = 0;
+//DELETED: 2010-05-03
+//ADDED: 2010-05-03
+	int 			option_dtmf = 0;
+//ADDED: 2010-05-03
+	int 			option_verbose = 0;
+	char 			*option_tts_lang;
+	char 			*option_tts_spkr;
+	/* Vars to store cfg file options*/
+	const char 		*vcfg_primary_host = NULL;
+	const char 		*vcfg_backup_host = NULL;
+	const char 		*vcfg_default_tts_lang = NULL;
+	const char 		*vcfg_default_tts_spkr = NULL;
+	const char 		*vcfg_tts_txt_path = NULL;
+	int			vcfg_keep_synthesized_files = 0;
+	const char		*vcfg_recorded_files_path = NULL;
+	int 			vcfg_extended_verbose	= 0;
+	int 			vcfg_verbose		= 0;
+	/* Options to be used when dealing with voxlib*/
+	const char		*tts_lang = NULL;
+	const char		*tts_spkr = NULL;
+	int 			dev = 0;
+	int 			count 	= 0;
+
+	/* = (char*)calloc( 1, VERBIO_BUFFER_SIZE);*/ /*FIXME:dynamic array??*/
+	char			*samples[VERBIO_BUFFER_SIZE];
+	
+	char			*text_to_synth;
+	/* Keep file */
+	const int 		fflags 	= O_CREAT|O_TRUNC|O_WRONLY;
+	struct 			ast_filestream *s 	= '\0';
+	char 			filename[MAXPATHLEN] 	= "verbio-tts-";
+	char 			rec_file_path[MAXPATHLEN];
+	/* Helper vars*/
+	char 			text_full_path[MAXPATHLEN];
+	const char 		*tmp = NULL;
+	struct ast_config 	*vcfg;
+	struct ast_frame 	*f; /*audio data storage*/
+	int 			vcfg_init_delay = 0;
+	int 			vcfg_end_delay = 0;
+//DELETED: 2010-05-03
+//	int			all_stop = 0;
+//	int			all_pause = 0;
+//DELETED: 2010-05-03
+//ADDED: 2010-05-03
+	int				max_dtmf_len = 1;
+	char			dtmf_terminator = '#';
+//ADDED: 2010-05-03
+	int 			waitres = -1;
+//ADDED: 2016-01-11
+	int 			tts_speed = 120;
+	int 			tts_volume = 32768;
+//ADDED: 2016-01-11
+
+	verbio_reset_dtmf_result( chan);
+	
+	if( ast_strlen_zero( data)) 
+	{
+		ast_log( LOG_ERROR, "%s requires an argument (text or file"
+					" |[lang]|[speaker]|[options])\n",
+							verbio_prompt_app);
+		return -1;
+	}
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add(chan);
+	#endif
+
+	/* We need to make a copy of the input string if we are going to modify it! */
+	args = ast_strdupa( data);	
+	if( !args) 
+	{
+		ast_log( LOG_ERROR, "Out of memory!\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	
+	if(( argc = ast_app_separate_args( args, args_sep, argv, sizeof(argv) / sizeof(argv[0])))) 
+	{
+		text_or_file = argv[0];
+		options = argv[1];
+	}
+
+	/* --------------------------------- */
+	/* ----- Get options from user ----- */
+	/* --------------------------------- */
+	/* <TTS lang> */
+	option_tts_lang = strsep(&options, str_sep);
+	if( option_tts_lang)
+	{
+		if( !strcmp( option_tts_lang, ""))
+			option_tts_lang = NULL;
+	}
+	/* <TTS spkr> */
+	option_tts_spkr = strsep(&options, str_sep);
+	if( option_tts_spkr)
+	{
+		if( !strcmp( option_tts_spkr, ""))
+			option_tts_spkr = NULL;
+	}
+	/* <Misc options> */
+	opt = strsep(&options, str_sep);	
+	if( opt) 
+	{
+		if( strchr( opt, 'f'))/*tread text_or_file as a file*/
+			option_asfile = 1;
+		if( strchr( opt, 'a'))
+			option_answer = 1; 
+		if( strchr( opt, 'n'))/*Do not hangup on verbio error*/
+			option_no_hangup_on_verbio_err = 1; 
+//DELETED: 2010-05-03
+//		if( strchr( opt, 'p'))/*Enable prompt pause/resume*/
+//		{
+//			option_enable_pause = 1;
+//			if( strcasestr( opt, "p."))	
+//				all_pause = 1; 
+//			else if( strcasestr( opt, "p#"))
+//				pause_key = '#';
+//			else if( strcasestr( opt, "p*"))
+//				pause_key = '*'; 
+//			else if( strcasestr( opt, "p0"))
+//				pause_key = '0'; 
+//			else if( strcasestr( opt, "p1"))
+//				pause_key = '1'; 
+//			else if( strcasestr( opt, "p2"))
+//				pause_key = '2'; 
+//			else if( strcasestr( opt, "p3"))
+//				pause_key = '3'; 
+//			else if( strcasestr( opt, "p4"))
+//				pause_key = '4'; 
+//			else if( strcasestr( opt, "p5"))
+//				pause_key = '5'; 
+//			else if( strcasestr( opt, "p6"))
+//				pause_key = '6'; 
+//			else if( strcasestr( opt, "p7"))
+//				pause_key = '7'; 
+//			else if( strcasestr( opt, "p8"))
+//				pause_key = '8'; 
+//			else if( strcasestr( opt, "p9"))
+//				pause_key = '9'; 
+//		}
+//		if( strchr( opt, 's'))/*Enable prompt stop*/
+//		{
+//			option_enable_stop = 1;
+//			if( strcasestr( opt, "s."))
+//				all_stop = 1;
+//			else if( strcasestr( opt, "s#"))
+//				stop_key = '#'; 
+//			else if( strcasestr( opt, "s*"))
+//				stop_key = '*'; 
+//			else if( strcasestr( opt, "s0"))
+//				stop_key = '0'; 
+//			else if( strcasestr( opt, "s1"))
+//				stop_key = '1'; 
+//			else if( strcasestr( opt, "s2"))
+//				stop_key = '2'; 
+//			else if( strcasestr( opt, "s3"))
+//				stop_key = '3'; 
+//			else if( strcasestr( opt, "s4"))
+//				stop_key = '4'; 
+//			else if( strcasestr( opt, "s5"))
+//				stop_key = '5'; 
+//			else if( strcasestr( opt, "s6"))
+//				stop_key = '6'; 
+//			else if( strcasestr( opt, "s7"))
+//				stop_key = '7'; 
+//			else if( strcasestr( opt, "s8"))
+//				stop_key = '8'; 
+//			else if( strcasestr( opt, "s9"))
+//				stop_key = '9'; 
+//		}
+//DELETED: 2010-05-03
+//ADDED: 2010-05-03
+		if (strchr(opt, 'd'))
+			option_dtmf = 1; /* enable dtmf detection*/
+//ADDED: 2010-05-03
+		if( strchr( opt, 'v'))
+			option_verbose = 1;
+		if( strchr( opt, 'b'))
+			option_beep = 1;/*play a beep before prompt*/
+	}
+
+	/* ----------------------------------------------- */
+	/* ----- Get options from Verbio config file ----- */
+	/* ----------------------------------------------- */
+	/* TODO: In future versions copy verbio settings to some kind of data 
+		structure 
+	*/
+	vcfg = verbio_load_asterisk_config();
+ 
+	/* Parse Verbio config*/
+	if( !vcfg) 
+	{
+		ast_log( LOG_ERROR, "Error opening configuration file %s\n", VERBIO_CFG);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	if( !( vcfg_primary_host = ast_variable_retrieve( vcfg, "general", "primary_vox_server"))) 
+		vcfg_primary_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_backup_host = ast_variable_retrieve( vcfg, "general", "backup_vox_server"))) 	
+		vcfg_backup_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_default_tts_lang = ast_variable_retrieve( vcfg, "tts", "default_language"))) 
+		ast_log( LOG_WARNING, "Error reading default_language option\n");
+	
+	if( !( vcfg_default_tts_spkr = ast_variable_retrieve( vcfg, "tts", "default_speaker"))) 
+		ast_log( LOG_WARNING, "Error reading default_speaker option\n");
+	
+	if( !( vcfg_tts_txt_path = ast_variable_retrieve( vcfg, "tts", "text_prompts_path"))) 
+		ast_log( LOG_WARNING, "Error reading text_prompts_path option\n");
+
+	if( !( tmp = ast_variable_retrieve( vcfg, "tts", "init_delay"))) 
+		tmp = VERBIO_TTS_INIT_DELAY;
+	vcfg_init_delay = atoi( tmp);
+
+	if( !( tmp = ast_variable_retrieve( vcfg, "tts", "end_delay"))) 
+		tmp = VERBIO_TTS_END_DELAY;
+	vcfg_end_delay = atoi( tmp);
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "verbose"))) 
+		tmp = "0";
+	vcfg_verbose = atoi( tmp);
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "extended_verbose"))) 
+		tmp = "0";
+	vcfg_extended_verbose = atoi( tmp);
+	
+	if( vcfg_verbose)
+	{
+		ast_log( LOG_NOTICE, "Verbose enabled in config file.\n");
+		option_verbose = 1;
+	}
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "keep_synthesized_files"))) 
+		tmp = "0";
+	vcfg_keep_synthesized_files = atoi( tmp);
+	
+	vcfg_recorded_files_path = ast_variable_retrieve(vcfg, "debug", "recorded_files_path");
+
+	/* ---------------------------------------------------- */
+	/* ----- Set options (to be used on voxlib calls) ----- */
+	/* ---------------------------------------------------- */
+	/* <language> */
+	if( !option_tts_lang)
+		tts_lang = vcfg_default_tts_lang;
+	else
+		tts_lang = option_tts_lang;
+	/* <Speaker> */
+	if( !option_tts_spkr)
+		tts_spkr = vcfg_default_tts_spkr;
+	else	
+		tts_spkr = option_tts_spkr;
+	/* <Text to read> */
+	if( option_asfile)
+	{
+		/* <Text file> */
+		if( text_or_file[0] != '/')/*FIXME: elegance...*/
+		{	/* relative path */
+			strcpy( text_full_path, vcfg_tts_txt_path);
+			strcat( text_full_path, "/");	
+			strcat( text_full_path, text_or_file);	
+		}
+		else
+		{	/* full path */
+			strcpy( text_full_path, text_or_file);
+		}
+		text_to_synth = ast_read_textfile( text_full_path);
+	}
+	else
+	{
+		text_to_synth = text_or_file;
+	}
+	/* <dev value> */
+	dev = verbio_get_dev( chan, option_verbose);
+
+	/* ---------------------------------------- */
+	/* --- Save synthesized audio options  ---- */
+	/* ---------------------------------------- */
+	if( vcfg_keep_synthesized_files)
+	{
+		char t_str[VERBIO_MAX_TSTR_SIZE];
+		time_t t = time( NULL );	
+		if( snprintf( t_str, VERBIO_MAX_TSTR_SIZE, "%d", (int)t) > VERBIO_MAX_TSTR_SIZE) 
+			ast_log( LOG_WARNING, "Filename may be truncated.\n"); 
+		strcat( filename, t_str);
+		strcat( filename, "-");
+		strcat( filename, chan->uniqueid);
+		if( vcfg_recorded_files_path)
+		{
+			strcpy( rec_file_path, vcfg_recorded_files_path);
+			strcat( rec_file_path, "/");
+			strcat( rec_file_path, filename);
+		}
+		else
+		{
+			strcpy( rec_file_path, VERBIO_DEF_REC_PATH);
+			strcat( rec_file_path, filename);
+		}
+	}
+
+//ADDED: 2010-05-03
+	/* -------------------------------------- */
+	/* ------ Options set via chan vars ----- */
+	/* -------------------------------------- */
+	/* */
+	if ((tmp = pbx_builtin_getvar_helper(chan, "VERBIO_DTMF_MAXLEN")) && !ast_strlen_zero(tmp))
+		max_dtmf_len = atoi(tmp);
+
+	/* See if a terminator is specified */
+	if ((tmp = pbx_builtin_getvar_helper(chan, "VERBIO_DTMF_TERMINATOR"))) {
+		if (ast_strlen_zero(tmp))
+			dtmf_terminator = '#';
+		else
+			dtmf_terminator = tmp[0];
+	}
+//ADDED: 2010-05-03
+
+	if( option_verbose)
+	{
+		ast_log( LOG_NOTICE, "--------------------------\n");
+		ast_log( LOG_NOTICE, "VerbioPrompt param summary:\n");
+		ast_log( LOG_NOTICE, " Prim vox srv : %s\n", vcfg_primary_host);
+		ast_log( LOG_NOTICE, " Bckp vox srv : %s\n", vcfg_backup_host);
+		ast_log( LOG_NOTICE, " TTS language : %s\n", tts_lang);
+		ast_log( LOG_NOTICE, " TTS speaker  :   %s\n", tts_spkr);
+		if( option_asfile)
+			ast_log( LOG_NOTICE, " Synth from %s text file\n", text_full_path);
+		ast_log( LOG_NOTICE, " Text to synth: %s\n", text_to_synth);
+		ast_log( LOG_NOTICE, " Init delay   : %d\n", vcfg_init_delay);
+		ast_log( LOG_NOTICE, " End delay    : %d\n", vcfg_end_delay);
+		if( vcfg_keep_synthesized_files)
+			ast_log( LOG_NOTICE, " Rec file      :%s.%s\n", rec_file_path, EXT);
+//DELETED: 2010-05-03
+//		if( option_enable_stop)
+//			ast_log( LOG_NOTICE, " Stop enabled [key=%c]\n", stop_key);
+//		
+//		if( option_enable_pause)
+//			ast_log( LOG_NOTICE, " Pause/resume enabled [key=%c]\n", pause_key);
+//		
+//		if( option_enable_pause && option_enable_stop)
+//			if( stop_key == pause_key)
+//				ast_log( LOG_NOTICE, " Warning: 'stop' and 'pause/resume' using the same key. Stop has priority\n");
+//DELETED: 2010-05-03
+//ADDED: 2010-05-03
+		if (option_dtmf) {
+			ast_log(LOG_NOTICE, " Max dtmf len : %d\n", max_dtmf_len);
+			ast_log(LOG_NOTICE, " Dtmf term    : %c\n", dtmf_terminator);
+		}
+//ADDED: 2010-05-03
+				
+		ast_log( LOG_NOTICE, " Voxlib device: %d\n", dev);
+		ast_log( LOG_NOTICE, "--------------------------\n");
+	}
+	
+	/* ------------------ */
+	/* Set channel format */
+	/* ------------------ */
+	/* Verbio only accepts alaw ulaw or slin...we are going to use alaw */
+	if( ast_set_write_format( chan, AUDIO_FORMAT) <  0)
+	{
+		ast_log( LOG_ERROR, "AUDIO_FORMAT (write) failed.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	if( ast_set_read_format( chan, AUDIO_FORMAT) <  0)
+	{
+		ast_log( LOG_ERROR, "AUDIO_FORMAT (read) failed.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+
+	}
+
+	/* ---------------------------- */
+	/* ----- Verbio TTS stuff ----- */
+	/* ---------------------------- */
+	/* If we can not set tts lang.. exit*/
+	if( vox_setparm( dev,VXCH_DEFTTSLANG, tts_lang) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set TTS language to %s.\n", tts_lang);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+	/* Speaker is not critical */
+	if( vox_setparm( dev,VXCH_TTSSPKNAME, tts_spkr) == -1)
+		ast_log( LOG_WARNING, "Can not set TTS speaker to %s.\n", tts_spkr);
+
+//ADDED: 2016-01-11
+	if( vox_setparm( dev,VXCH_TTSSPEED, &tts_speed) == -1)
+		ast_log( LOG_WARNING, "Can not set TTS speed to %d.\n", tts_speed);
+        if( vox_setparm( dev,VXCH_TTSVOLUME, &tts_volume) == -1)
+                ast_log( LOG_WARNING, "Can not set TTS volume to %d.\n", tts_volume);
+//ADDED: 2016-01-11
+
+	ssize_t synth = vox_playstr_open( dev, text_to_synth, VERBIO_CODEC);/*TODO:allow other formats? (ulaw and lin16)*/
+	if( !synth)
+	{
+		ast_log( LOG_ERROR, "Fatal error on playstr_open %s\n", ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+
+	/* Answer the channel (if not up)*/
+	int res = 0;
+	if( chan->_state != AST_STATE_UP) 
+	{ 
+		if( option_answer) 
+		{
+			res = ast_answer(chan);
+		} 
+		else 
+		{
+			/* At the user's option, skip if the line is not up */
+			ast_log(LOG_WARNING, "Not answering the channel.\n");
+			vox_playstr_close( dev, synth);
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;
+		}
+	}
+	
+	if( res) 
+	{
+		ast_log(LOG_WARNING, "Could not answer channel '%s'\n", chan->name);
+		vox_playstr_close( dev, synth);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+
+	/* keep a copy of synth audio */
+	if( vcfg_keep_synthesized_files)
+		s = ast_writefile( rec_file_path, EXT, NULL, fflags , 0, 0644);
+	
+	if( option_beep) 
+	{
+		res = ast_streamfile( chan, "beep", chan->language);
+		if( !res) 
+			res = ast_waitstream( chan, "");
+		else 
+			ast_log(LOG_WARNING, "ast_streamfile failed on %s\n", chan->name);
+		ast_stopstream(chan);
+	}
+
+	/* Ensure no streams are currently running..FIXME:necessary? */
+	ast_stopstream( chan);
+
+	/*while( ast_waitfor( chan, -1) < -1)
+		f = ast_read( chan);*/
+	/* FIXME: First samples corrupted? */
+	/* Initial delay */
+	ast_safe_sleep( chan, vcfg_init_delay);
+
+//DELETED: 2010-05-03
+//	int paused = 0;
+//DELETED: 2010-05-03
+	int done = 0;
+	while( !done)
+	{
+		waitres = ast_waitfor( chan, MAX_WAIT_TIME);
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "Waited %d ms\n", waitres);
+
+		if( waitres < 0)
+		{
+			ast_log(LOG_NOTICE, "Wait failed.\n");
+			vox_playstr_close( dev, synth);
+			if( vcfg_keep_synthesized_files)
+				ast_closestream(s);
+			ast_stopstream(chan);
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;	
+		}
+		else if( waitres == 0)
+		{
+			if( vcfg_extended_verbose)
+				ast_log(LOG_NOTICE, "Wait timeout!\n");
+
+			count = vox_playstr_read( synth, samples, 8000);
+			
+			/* Check if we are done */
+			if( count < 8000)
+				done = 1;
+
+			continue;
+		}
+		
+		/* Read a frame... we will reuse this frame for writing.
+		   FIXME:create a new frame...?*/
+		f = ast_read( chan);
+		/* Hangup detection */
+		if( !f)
+		{
+			ast_log(LOG_NOTICE, "Hangup detected.\n");
+			vox_playstr_close( dev, synth);
+			if( vcfg_keep_synthesized_files)
+				ast_closestream(s);
+			ast_stopstream(chan);
+
+			#ifdef VERBIO_CLOSE_ON_HANGUP	
+			vox_devclose( dev);
+			if( option_verbose)
+				ast_log(LOG_NOTICE, "device %d closed.\n", dev);
+			#endif	
+			
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;	
+		}
+		
+//DELETED: 2010-05-03
+//		if( !paused && (f->frametype == AST_FRAME_VOICE)) 
+//DELETED: 2010-05-03
+//ADDED: 2010-05-03
+		if (f->frametype == AST_FRAME_VOICE)
+//ADDED: 2010-05-03
+		{
+			/* Get a number (f->samples) of synth audio */
+			/*TODO: avoid blocking functions */
+			count = vox_playstr_read( synth, samples, f->samples);
+			
+			/* Check if we are done */
+			if( count < f->samples)
+				done = 1;
+		
+			/* Tell the frame which are it's new samples */
+			#if ASTERISK_VERSION_NUM < AST_601
+			f->data = samples;
+			#else
+			f->data.ptr = samples;
+			#endif
+
+			 /* user also wants to write to a file*/
+			if( vcfg_keep_synthesized_files)
+			{
+				if( ast_writestream( s, f)) 
+					ast_log(LOG_WARNING, "Error writing frame to file.\n");
+			}
+			/* Write frame to chan */
+			/*ast_queue_frame( chan, f);*//* internally frees f*/
+			if( ast_write(chan, f))/*TODO: handle this case*/
+				ast_log(LOG_ERROR, "Error writing frame to chan.\n");
+		}
+//DELETED: 2010-05-03
+//#if ASTERISK_VERSION_NUM >= AST_8
+//		else if( option_enable_stop && (f->frametype == AST_FRAME_DTMF) && ((all_stop == 1) || (f->subclass.integer == stop_key))) /*stop on dtmf key*/
+//#else
+//		else if( option_enable_stop && (f->frametype == AST_FRAME_DTMF) && ((all_stop == 1) || (f->subclass == stop_key))) /*stop on dtmf key*/
+//#endif
+//		{	/*priorize stop*/
+//#if ASTERISK_VERSION_NUM >= AST_8
+//			verbio_set_dtmf_result( chan, f->subclass.integer);
+//#else
+//			verbio_set_dtmf_result( chan, f->subclass);
+//#endif
+//			done = 1;
+//			if( option_verbose)
+//#if ASTERISK_VERSION_NUM >= AST_8
+//				ast_log(LOG_NOTICE, "stop key (%c) pressed\n", f->subclass.integer);
+//#else
+//				ast_log(LOG_NOTICE, "stop key (%c) pressed\n", f->subclass);
+//#endif
+//		}
+//#if ASTERISK_VERSION_NUM >= AST_8
+//		else if( option_enable_pause && (f->frametype == AST_FRAME_DTMF) && ((all_pause == 1) || (f->subclass.integer == pause_key))) /*pause/resume on dtmf key*/
+//#else
+//		else if( option_enable_pause && (f->frametype == AST_FRAME_DTMF) && ((all_pause == 1) || (f->subclass == pause_key))) /*pause/resume on dtmf key*/
+//#endif
+//		{
+//			if( paused == 0)
+//				paused = 1;
+//			else
+//				paused = 0;
+//
+//			if( option_verbose)
+//#if ASTERISK_VERSION_NUM >= AST_8
+//				ast_log(LOG_NOTICE, "pause/resume key (%c) pressed\n", f->subclass.integer);
+//#else
+//				ast_log(LOG_NOTICE, "pause/resume key (%c) pressed\n", f->subclass);
+//#endif
+//		}
+//DELETED: 2010-05-03
+//ADDED: 2010-05-03
+		else if (f->frametype == AST_FRAME_DTMF) {
+			if( option_dtmf)
+			{
+				/* Set detected dtmf to dialplan var*/
+#if ASTERISK_VERSION_NUM >= AST_8
+				verbio_set_dtmf_result( chan, f->subclass.integer);
+#else
+				verbio_set_dtmf_result( chan, f->subclass);
+#endif
+				int dtmflen = strlen(pbx_builtin_getvar_helper( chan, "VDTMF_RESULT"));
+#if ASTERISK_VERSION_NUM >= AST_8
+				if( (dtmflen >= max_dtmf_len) || f->subclass.integer == dtmf_terminator)
+#else
+				if( (dtmflen >= max_dtmf_len) || f->subclass == dtmf_terminator)
+#endif
+				{
+					if( option_verbose)
+						ast_log(LOG_NOTICE, "dtmf max len or terminator detected\n");
+				
+					ast_frfree(f);
+					break;
+				}
+			}
+		}
+//ADDED: 2010-05-03
+		ast_frfree( f);
+	}
+	if( vcfg_keep_synthesized_files)
+		ast_closestream(s);
+	/* FIXME: Last samples (sometimes) corrupted? */
+	/* End delay */ 
+	ast_safe_sleep( chan, vcfg_end_delay);
+
+	ast_config_destroy( vcfg);
+
+	/*Voxlib cleanup*/
+	vox_playstr_close( dev, synth);
+	
+	ast_stopstream(chan);
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove(u);
+	#endif
+	return 0;
+}
+
+/*! \brief Recognition application. */
+static int verbio_rec( struct ast_channel *chan, DATA_TYPE data)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	int 	res 	= 0;
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 			localuser *u;
+	#else
+	struct 			ast_module_user *u;
+	#endif
+	char 	*options	=NULL;
+	char 	*args 		= NULL;
+	int 	argc 		= 0;
+	char 	*argv[1];
+	struct ast_config *vcfg;
+	char	*opt 		= NULL;
+	/* Config file opts */
+	const char 	*vcfg_default_asr_config= NULL;
+	const char 	*vcfg_default_asr_lang 	= NULL;
+	const char 	*vcfg_primary_host	= NULL;
+	const char 	*vcfg_backup_host	= NULL;
+	int 		vcfg_keep_recorded_files= 0;
+	int 		vcfg_extended_verbose	= 0;
+	int 		vcfg_verbose		= 0;
+	const char	*vcfg_recorded_files_path = NULL;
+	const char 	*vcfg_max_sil 		= NULL;
+	const char 	*vcfg_init_sil		= NULL;
+	const char	*vcfg_max_ref		= NULL;	
+	const char 	*vcfg_min_ref		= NULL;
+	int 		vcfg_absolute_timeout 	= 0;
+	/* Input Options */
+	int 	option_no_hangup_on_verbio_err = 0;
+	int	option_answer		= 0;
+	char	*option_init_sil	= NULL;
+	char 	*option_max_sil 	= NULL;
+	char 	*option_abs_timeout 	= NULL;
+	int	abs_timeout		= atoi(VERBIO_DEF_ABS_TMOUT);
+	int 	option_beep 		= 0;
+	int 	option_dtmf		= 0;
+	int 	option_verbose 		= 0;
+	char	*option_asr_config 	= NULL;
+	char	*option_asr_lang 	= NULL;
+	/* Vars to be used when dealing with voxlib */
+	int 	dev 	= 0;
+	const char	*asr_config 	= NULL;
+	const char	*asr_lang 	= NULL;
+	int 	n 	= 0;
+	ssize_t 	recdev 	= 0;
+	VX_RSP 	rsp;
+	int 	init_sil	= atoi(VERBIO_INIT_SIL);
+	int 	max_sil		= atoi(VERBIO_MAX_SIL);
+	struct ast_frame *f;
+	float	max_ref		= VERBIO_MAX_REF;
+	float 	min_ref		= VERBIO_MIN_REF;
+	/* Keep recorded files related vars */
+	int 	fflags 			= O_CREAT|O_TRUNC|O_WRONLY;
+	struct 	ast_filestream *s 	= '\0';
+	char 	filename[MAXPATHLEN] 	= "verbio-rec-";
+	char 	rec_file_path[MAXPATHLEN];
+	/* Misc vars*/
+	const char 	*tmp = NULL;
+	/* timeout control*/
+	time_t start, current;
+
+	int max_dtmf_len = 1;
+	char dtmf_terminator = '#';
+	int waitres = -1;
+
+
+	verbio_reset_dtmf_result( chan);/* Avoid confusion among recognitions*/
+	
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add(chan);
+	#endif
+
+	/* We need to make a copy of the input string if we are going to modify it! */
+	args = ast_strdupa(data);	
+	if( !args) 
+	{
+		ast_log(LOG_ERROR, "Out of memory!\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	
+	if(( argc = ast_app_separate_args(args, args_sep, argv, sizeof(argv) / sizeof(argv[0]))))
+		options = argv[0];
+
+
+	/* --------------------------------- */
+	/* ----- Get options from user ----- */
+	/* --------------------------------- */
+	/* <ASR config> */
+	option_asr_config = strsep(&options, str_sep);
+	if( option_asr_config)
+	{
+		if( !strcmp( option_asr_config, ""))
+			option_asr_config = NULL;
+	}
+	/* <ASR lang> */
+	option_asr_lang = strsep( &options, str_sep);
+	if( option_asr_lang)
+	{
+		if( !strcmp( option_asr_lang, ""))
+			option_asr_lang = NULL;
+	}
+	/* <init sil> */
+	option_init_sil = strsep(&options, str_sep);
+	if( option_init_sil)
+	{
+		if( !strcmp( option_init_sil, ""))
+			option_init_sil = NULL;
+	}
+	/* <max sil> */
+	option_max_sil = strsep(&options, str_sep);
+	if( option_max_sil)
+	{
+		if( !strcmp( option_max_sil, ""))
+			option_max_sil = NULL;
+	}
+	/* <abs timeout> */
+	option_abs_timeout = strsep(&options, str_sep);
+	if( option_abs_timeout)
+	{
+		if( !strcmp( option_abs_timeout, ""))
+			option_abs_timeout = NULL;
+	}
+	/* <Misc options> */
+	opt = strsep( &options, str_sep);	
+	if( opt) 
+	{
+		if( strchr( opt, 'v'))
+			option_verbose = 1;
+		if( strchr( opt, 'a'))
+			option_answer = 1;
+		if( strchr( opt, 'n'))
+			option_no_hangup_on_verbio_err = 1;
+		if( strchr( opt, 'b'))
+			option_beep = 1;/*play a beep before rec*/
+		if( strchr( opt, 'd'))
+			option_dtmf = 1; /* enable dtmf detection*/	
+		
+	}
+	
+	/* ----------------------------------------------- */
+	/* ----- Get options from Verbio config file ----- */
+	/* ----------------------------------------------- */
+	vcfg = verbio_load_asterisk_config();
+	if( !vcfg) 
+	{
+		ast_log(LOG_WARNING, "Error opening configuration file %s\n", VERBIO_CFG);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+
+	if( !( vcfg_primary_host = ast_variable_retrieve( vcfg, "general", "primary_vox_server"))) 
+		vcfg_primary_host = VERBIO_DEF_HOST;
+
+	if( !( vcfg_backup_host = ast_variable_retrieve( vcfg, "general", "backup_vox_server"))) 	
+		vcfg_backup_host = VERBIO_DEF_HOST;
+
+	if( !( vcfg_default_asr_config = ast_variable_retrieve(vcfg, "asr", "default_config"))) 
+		ast_log( LOG_WARNING, "Error reading default_config option\n");
+
+	if( !( vcfg_default_asr_lang = ast_variable_retrieve(vcfg, "asr", "default_language"))) 
+		ast_log( LOG_WARNING, "Error reading default_language option\n");
+	
+	if( !( vcfg_init_sil = ast_variable_retrieve(vcfg, "asr", "init_sil"))) 
+		vcfg_init_sil = VERBIO_INIT_SIL;
+
+	if( !( vcfg_max_sil = ast_variable_retrieve(vcfg, "asr", "max_sil"))) 
+		vcfg_max_sil = VERBIO_MAX_SIL;
+	
+	if( !( vcfg_max_ref = ast_variable_retrieve(vcfg, "asr", "max_ref"))) 
+		vcfg_max_ref = NULL;
+	
+	if( !( vcfg_min_ref = ast_variable_retrieve(vcfg, "asr", "min_ref"))) 
+		vcfg_min_ref = NULL;
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "asr", "absolute_timeout"))) 
+		tmp = VERBIO_DEF_ABS_TMOUT;
+	vcfg_absolute_timeout = atoi( tmp);
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "verbose"))) 
+		tmp = "0";
+	vcfg_verbose = atoi( tmp);
+	if( vcfg_verbose)
+	{
+		ast_log( LOG_NOTICE, "Verbose enabled in config file.\n");
+		option_verbose = 1;
+	}
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "extended_verbose"))) 
+		tmp = "0";
+	vcfg_extended_verbose = atoi( tmp);
+	
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "keep_recorded_files"))) 
+		tmp = "0";
+	vcfg_keep_recorded_files = atoi( tmp);
+	
+	vcfg_recorded_files_path = ast_variable_retrieve(vcfg, "debug", "recorded_files_path");
+
+	/* ---------------------------------------------------- */
+	/* ----- Set options (to be used on voxlib calls) ----- */
+	/* ---------------------------------------------------- */
+	/* <ASR config> */
+	if( !option_asr_config)
+		asr_config = vcfg_default_asr_config;
+	else
+		asr_config = option_asr_config;
+	/* <ASR lang> */
+	if( !option_asr_lang)
+		asr_lang = vcfg_default_asr_lang;
+	else	
+		asr_lang = option_asr_lang;
+	/* <init sil> */
+	if( !option_init_sil)
+		init_sil = atoi( vcfg_init_sil);
+	else
+		init_sil = atoi( option_init_sil);
+	/* <max sil> */
+	if( !option_max_sil)
+		max_sil = atoi( vcfg_max_sil);
+	else	
+		max_sil = atoi( option_max_sil);
+	/* <absolute timeout> */
+	if( !option_abs_timeout)
+		abs_timeout = vcfg_absolute_timeout;
+	else	
+		abs_timeout = atoi( option_abs_timeout);
+	/* <dev value> */
+	dev = verbio_get_dev( chan, option_verbose);
+
+	
+	/* ---------------------------------------- */
+	/* ----- Save recorded audio options  ----- */
+	/* ---------------------------------------- */
+	if( vcfg_keep_recorded_files)
+	{
+		char t_str[VERBIO_MAX_TSTR_SIZE];
+		time_t t = time( NULL );	
+		if( snprintf( t_str, VERBIO_MAX_TSTR_SIZE, "%d", (int)t) > VERBIO_MAX_TSTR_SIZE) 
+			ast_log( LOG_WARNING, "Filename may be truncated.\n"); 
+		strcat(filename, t_str);
+		strcat(filename, "-");
+		strcat(filename, chan->uniqueid);
+		if( vcfg_recorded_files_path)
+		{
+			strcpy( rec_file_path, vcfg_recorded_files_path);
+			strcat( rec_file_path, "/");
+			strcat( rec_file_path, filename);
+		}
+		else
+		{
+			strcpy( rec_file_path, VERBIO_DEF_REC_PATH);
+			strcat( rec_file_path, filename);
+		}
+	}
+	
+	/* -------------------------------------- */
+	/* ------ Options set via chan vars ----- */
+	/* -------------------------------------- */
+	/* */
+	if ((tmp = pbx_builtin_getvar_helper(chan, "VERBIO_DTMF_MAXLEN")) && !ast_strlen_zero(tmp))
+		max_dtmf_len = atoi(tmp);
+
+	/* See if a terminator is specified */
+	if ((tmp = pbx_builtin_getvar_helper(chan, "VERBIO_DTMF_TERMINATOR"))) {
+		if (ast_strlen_zero(tmp))
+			dtmf_terminator = '#';/*'\0';*/
+		else
+			dtmf_terminator = tmp[0];
+	}
+	
+	if( option_verbose)
+	{
+		ast_log( LOG_NOTICE, "------------------------\n");
+		ast_log( LOG_NOTICE, "VerbioRec param summary:\n");
+		ast_log( LOG_NOTICE, " Prim vox srv : %s\n", vcfg_primary_host);
+		ast_log( LOG_NOTICE, " Bckp vox srv : %s\n", vcfg_backup_host);
+		ast_log( LOG_NOTICE, " ASR config   : %s\n", asr_config);
+		ast_log( LOG_NOTICE, " ASR lang     :   %s\n", asr_lang);
+		ast_log( LOG_NOTICE, " Init sil     :   %d\n", init_sil);
+		ast_log( LOG_NOTICE, " Max  sil     :   %d\n", max_sil);
+		ast_log( LOG_NOTICE, " Abs timeout  : %d\n", abs_timeout);
+		if( vcfg_max_ref)
+			ast_log( LOG_NOTICE, " Max  ref     : %f\n", atof( vcfg_max_ref));
+		if( vcfg_min_ref)
+			ast_log( LOG_NOTICE, " Min  ref     : %f\n", atof( vcfg_min_ref));
+		if( option_dtmf)
+		{
+			ast_log( LOG_NOTICE, " Max dtmf len : %d\n", max_dtmf_len);
+			ast_log( LOG_NOTICE, " Dtmf term    : %c\n", dtmf_terminator);
+		}
+		ast_log( LOG_NOTICE, " Voxlib device: %d\n", dev);
+		if( vcfg_keep_recorded_files)
+			ast_log( LOG_NOTICE, " Rec file      :%s.%s\n", rec_file_path, EXT);
+		ast_log( LOG_NOTICE, "------------------------\n");
+	}
+
+	/* ----------------------------- */
+	/* Answer the channel (if not up)*/
+	/* ----------------------------- */
+	if( chan->_state != AST_STATE_UP) 
+	{
+		if( option_answer) 
+		{
+			res = ast_answer(chan);
+		} 
+		else 
+		{
+			/* At the user's option, skip if the line is not up */
+			ast_log(LOG_WARNING, "Not answering the channel.\n");
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;
+		}	
+	}
+	
+	if( res) 
+	{
+		ast_log(LOG_WARNING, "Could not answer channel '%s'\n", chan->name);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+
+	/* ------------------ */
+	/* Set channel format */
+	/* ------------------ */
+	/* Verbio only accepts alaw ulaw and slin...we are going to use alaw*/
+	if( ast_set_write_format(chan, AUDIO_FORMAT) <  0)
+	{
+		ast_log(LOG_NOTICE, "AUDIO_FORMAT (write) failed.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	if( ast_set_read_format(chan, AUDIO_FORMAT) <  0)
+	{
+		ast_log(LOG_NOTICE, "AUDIO_FORMAT (read) failed.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+
+	/* ---------------------------- */
+	/* ----- Verbio Rec stuff ----- */
+	/* ---------------------------- */
+	vox_clrrsp( &rsp);
+	rsp.maxsil = max_sil;
+	rsp.initsil = init_sil;
+
+	/* If we can not set asr config.. exit*/
+	if( vox_setparm( dev,VXCH_DEFASRCFG, asr_config) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set ASR config to %s. [%s]\n", asr_config, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;	
+	}
+	/* If we can not set asr lang.. exit*/
+	if( vox_setparm( dev,VXCH_DEFASRLNG, asr_lang) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set ASR lang to %s. [%s]\n", asr_lang, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;	
+	}
+	/* Open recognition stream */
+	if( (recdev = vox_recstr_open( dev, &rsp, VERBIO_CODEC | MC_INITSIL )) == -1) 
+	{
+		ast_log(LOG_ERROR, "vox_recstr_open %d. [%s]\n", dev, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;	
+	}
+
+	/* maxref  VAD */
+	if( vcfg_max_ref != NULL)
+	{
+		max_ref = atof( vcfg_max_ref);
+		if( max_ref > VERBIO_MAX_REF)
+			max_ref = VERBIO_MAX_REF;
+		
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "vox_setparm max_ref = %f\n", max_ref);
+		
+		if( vox_setparm( dev, VXGB_VSDMAXREF, &max_ref) == -1) 
+			ast_log( LOG_ERROR, "Error setting max_ref.\n");
+	}
+
+	/* minref  VAD */
+	if( vcfg_min_ref != NULL)
+	{
+		min_ref = atof( vcfg_min_ref);
+		if( min_ref >= VERBIO_MAX_REF)
+		{
+			min_ref = VERBIO_MAX_REF * 0.8;
+			ast_log( LOG_WARNING, "(min_ref >= VERBIO_MAX_REF). min_ref set to: %f\n", min_ref);
+		}
+
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "vox_setparm min_ref = %f\n", min_ref);
+		
+		if( vox_setparm( dev, VXGB_VSDMINREF, &min_ref) == -1)
+			ast_log( LOG_ERROR, "Error setting min_ref.\n");	
+	}
+
+	/* keep a copy of what speaker says and let the user know (via a chan var)
+	   which file corresponds to actual recording */
+	if( vcfg_keep_recorded_files)
+	{
+		s = ast_writefile( rec_file_path, EXT, NULL, fflags , 0, 0644);
+		pbx_builtin_setvar_helper( chan, "VASR_REC_FILE", rec_file_path);
+	}
+	
+	if( option_beep) 
+	{
+		/* Some code to play a nice little beep to signify the start of the record operation */
+		res = ast_streamfile( chan, "beep", chan->language);
+		if( !res) 
+			res = ast_waitstream( chan, "");
+		else 
+			ast_log(LOG_WARNING, "ast_streamfile failed on %s\n", chan->name);
+		ast_stopstream(chan);
+	}
+
+	/* Ensure no streams are currently running.. FIXME: necessary? */
+	ast_stopstream( chan);
+
+	/* Recognition loop */
+	time(&start);
+	while( 1)
+	{
+		time(&current);
+		if( (current - start) >= abs_timeout)
+		{
+			ast_log(LOG_NOTICE, "Absolute timeout reached [%d seconds].\n", (int)(current - start));
+			break; 
+		}
+		waitres = ast_waitfor( chan, MAX_WAIT_TIME);
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "Waited %d ms\n", waitres);
+
+		if( waitres < 0)
+		{
+			ast_log(LOG_NOTICE, "Wait failed.\n");
+			vox_recstr_close( dev, recdev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s);			
+			ast_stopstream(chan);
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;	
+		}
+		else if( waitres == 0)
+		{
+			if( vcfg_extended_verbose)
+				ast_log(LOG_NOTICE, "Wait timeout!\n");
+
+			continue;
+		}
+
+		/* Read a frame*/
+		f = ast_read( chan);
+		if( !f)
+		{
+			ast_log( LOG_NOTICE, "Hangup detected.\n");
+ 			vox_recstr_close( dev, recdev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s);
+			ast_stopstream(chan);
+
+			#ifdef VERBIO_CLOSE_ON_HANGUP	
+			vox_devclose( dev);
+			if( option_verbose)
+				ast_log(LOG_NOTICE, "device %d closed.\n", dev);
+			#endif
+	
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+ 			return -1;
+		}
+		
+		if( f->frametype == AST_FRAME_VOICE)
+		{
+			/* Write frame to file */
+			if( vcfg_keep_recorded_files)
+			{
+				if( ast_writestream( s, f)) 
+					ast_log(LOG_WARNING, "Error writing frame to rec file.\n");
+			}
+			/* Pass our frame to recognizer */
+			/*TODO: avoid blocking functions */
+			#if ASTERISK_VERSION_NUM < AST_601 
+			n = vox_recstr_write( recdev, f->data, f->samples);
+			#else
+			n = vox_recstr_write( recdev, f->data.ptr, f->samples);
+			#endif 
+
+			/* Check if we are done */
+			if( n < f->samples)
+			{
+				ast_frfree(f);
+				break;
+			}
+		}
+		else if( f->frametype == AST_FRAME_DTMF) 
+		{
+			if( option_dtmf)
+			{
+				/* Set detected dtmf to dialplan var*/
+#if ASTERISK_VERSION_NUM >= AST_8
+				verbio_set_dtmf_result( chan, f->subclass.integer);
+#else
+				verbio_set_dtmf_result( chan, f->subclass);
+#endif
+				int dtmflen = strlen(pbx_builtin_getvar_helper( chan, "VDTMF_RESULT"));
+#if ASTERISK_VERSION_NUM >= AST_8
+				if( (dtmflen >= max_dtmf_len) || f->subclass.integer == dtmf_terminator)
+#else
+				if( (dtmflen >= max_dtmf_len) || f->subclass == dtmf_terminator)
+#endif
+				{
+					if( option_verbose)
+						ast_log(LOG_NOTICE, "dtmf max len or terminator detected\n");
+					ast_frfree(f);
+					break; 
+				}
+			}
+		}
+		else if( vcfg_extended_verbose && option_verbose)
+		{
+			ast_log(LOG_WARNING, "Ooops! Unknown frame type [%d].\n", (int)f->frametype);	
+		}
+
+		ast_frfree( f);
+	}
+	if( vcfg_keep_recorded_files)
+		ast_closestream(s);
+	
+	/* Get and set (as chan vars) asr result */
+	verbio_set_asr_result( chan, dev);
+
+	ast_config_destroy( vcfg);
+
+	/* Cleanup */
+	vox_recstr_close( dev, recdev);
+	
+	ast_stopstream(chan);
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove(u);
+	#endif
+	return res;
+
+}
+
+/*! \brief Prompt and recognition function (implements bargein). */
+static int verbio_prompt_and_rec( struct ast_channel *chan, DATA_TYPE data)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	/*
+		This function allows us to launch a promt and a recognition at 
+		the same time. As soon as the recognizer has some result for us,
+		prompt will be stoped (if bargein option is active).
+	*/
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 			localuser *u;
+	#else
+	struct 			ast_module_user *u;
+	#endif
+	/* Input options */
+	char 	*options	= NULL;
+	char 	*text_or_file 	= NULL;
+	char 	*args;
+	int 	argc = 0;
+	char	*argv[2];
+	char	*opt;
+	/*--*/
+	int 	option_answer 		= 0;
+	int	option_no_hangup_on_verbio_err = 0;
+	int 	option_asfile 		= 0;
+	int 	option_verbose 		= 0;
+	int	option_bargein 		= 0;
+	int 	option_interrupt	= 0;
+	int 	option_beep 		= 0;
+	int 	option_dtmf		= 0;
+	int 	option_stop_on_dtmf	= 0;
+	int	abs_timeout		= atoi(VERBIO_DEF_ABS_TMOUT);
+	char 	*option_abs_timeout 	= NULL;
+	char 	*option_tts_lang	= NULL;
+	char 	*option_tts_spkr	= NULL;
+	char	*option_init_sil	= NULL;
+	char 	*option_max_sil 	= NULL;
+	char	*option_asr_config 	= NULL;
+	char	*option_asr_lang 	= NULL;
+	/* Vars to store cfg file options*/
+	const char 	*vcfg_primary_host	= NULL;
+	const char 	*vcfg_backup_host	= NULL;
+	const char 	*vcfg_default_tts_lang	= NULL;
+	const char 	*vcfg_default_tts_spkr	= NULL;
+	const char 	*vcfg_tts_txt_path	= NULL;
+	int 		vcfg_keep_recorded_files= 0;
+	int 		vcfg_extended_verbose	= 0;
+	int 		vcfg_verbose		= 0;
+	const char 	*vcfg_default_asr_config= NULL;
+	const char 	*vcfg_default_asr_lang 	= NULL;
+	const char 	*vcfg_max_sil 		= NULL;
+	const char 	*vcfg_init_sil		= NULL;
+	int		vcfg_keep_synthesized_files = 0;
+	const char	*vcfg_recorded_files_path = NULL;
+	const char	*vcfg_max_ref		= NULL;	
+	const char 	*vcfg_min_ref		= NULL;
+	int 		vcfg_absolute_timeout 	= atoi(VERBIO_DEF_ABS_TMOUT);
+	/* VAD Client-side params*/
+	const char	*vcfg_vad_mode 		= NULL;
+       	const char	*vcfg_low_factor	= NULL;
+	const char	*vcfg_high_factor	= NULL;
+	const char	*vcfg_final_factor	= NULL;
+	const char	*vcfg_final_high_factor	= NULL;
+	const char	*vcfg_min_high_thresh	= NULL;
+	const char	*vcfg_aam_min		= NULL;
+	const char	*vcfg_aam_max		= NULL;
+	/* Options to be used when dealing with voxlib*/
+	const char	*tts_lang	= NULL;
+	const char	*tts_spkr	= NULL;
+	int 		dev 		= 0;
+	int 		count 		= 0;
+	char		*samples[VERBIO_BUFFER_SIZE];
+	char		*text_to_synth	=  NULL;
+	const char	*asr_config 	= NULL;
+	const char	*asr_lang 	= NULL;
+	ssize_t 		recdev 		= 0;
+	VAD_PARAM 	*vsddev 	= 0;
+	VX_RSP 	rsp;
+	int 	init_sil= atoi(VERBIO_INIT_SIL);
+	int 	max_sil	= atoi(VERBIO_MAX_SIL);
+	float	max_ref	= VERBIO_MAX_REF;
+	float 	min_ref	= VERBIO_MIN_REF;
+	float 	low_factor = VERBIO_LOW_FACTOR;
+	float 	high_factor = VERBIO_HIGH_FACTOR;
+	float 	final_factor = VERBIO_FINAL_FACTOR;
+	float 	final_high_factor = VERBIO_FINAL_HIGH_FACTOR;
+	float 	min_high_thresh = VERBIO_MIN_HIGH_THRESH;
+	float 	aam_min = VERBIO_AAM_MIN;
+	float 	aam_max = VERBIO_AAM_MAX;
+
+	/* Keep files */
+	const int 	fflags 			= O_CREAT|O_TRUNC|O_WRONLY;
+	struct 		ast_filestream *s_tts 	= '\0';
+	struct 		ast_filestream *s_asr 	= '\0';
+	char 		filename_tts[MAXPATHLEN] 	= "verbio-tts-";
+	char 		filename_asr[MAXPATHLEN] 	= "verbio-rec-";
+	char 		rec_tts_file_path[MAXPATHLEN];
+	char 		rec_asr_file_path[MAXPATHLEN];
+	/* Helper vars*/
+	char 		text_full_path[MAXPATHLEN];
+	const char 	*tmp = NULL;
+	struct 		ast_config 	*vcfg;
+	struct 		ast_frame *f; /*audio data storage*/
+	int 		vcfg_init_delay = 0;
+	int 		vcfg_end_delay = 0;
+	/* timeout control*/
+	time_t start, current;
+
+	int max_dtmf_len = 1;
+	char dtmf_terminator = '#';
+	int waitres = -1;
+	
+	verbio_reset_dtmf_result( chan);/* Avoid confusion among recognitions*/
+		
+	if( ast_strlen_zero(data)) 
+	{
+		ast_log( LOG_WARNING, "%s requires an argument (text_or_file[|initsil][|maxsil][|tts_lang][|tts_spkr][|asr_conf][|asr_lang][|abs_timeout][|options])\n",verbio_prompt_and_rec_app);
+		return -1;
+	}
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add(chan);
+	#endif
+	
+	/* We need to make a copy of the input string if we are going to modify it! */
+	args = ast_strdupa( data);	
+	if( !args) 
+	{
+		ast_log( LOG_ERROR, "Out of memory!\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	
+	if(( argc = ast_app_separate_args( args, args_sep, argv, sizeof(argv) / sizeof(argv[0])))) 
+	{
+		text_or_file = argv[0];
+		options = argv[1];
+	}
+		
+	/* --------------------------------- */
+	/* ----- Get options from user ----- */
+	/* --------------------------------- */
+	/* <init sil> */
+	option_init_sil = strsep(&options, str_sep);
+	if( option_init_sil)
+	{
+		if( !strcmp( option_init_sil, ""))
+			option_init_sil = NULL;
+	}
+	/* <max sil> */
+	option_max_sil = strsep(&options, str_sep);
+	if( option_max_sil)
+	{
+		if( !strcmp( option_max_sil, ""))
+			option_max_sil = NULL;
+	}
+	/* <TTS lang> */
+	option_tts_lang = strsep(&options, str_sep);
+	if( option_tts_lang)
+	{
+		if( !strcmp( option_tts_lang, ""))
+			option_tts_lang = NULL;
+	}
+	/* <TTS spkr> */
+	option_tts_spkr = strsep(&options, str_sep);
+	if( option_tts_spkr)
+	{
+		if( !strcmp( option_tts_spkr, ""))
+			option_tts_spkr = NULL;
+	}
+	/* <ASR config> */
+	option_asr_config = strsep(&options, str_sep);
+	if( option_asr_config)
+	{
+		if( !strcmp( option_asr_config, ""))
+			option_asr_config = NULL;
+	}
+	/* <ASR lang> */
+	option_asr_lang = strsep( &options, str_sep);
+	if( option_asr_lang)
+	{
+		if( !strcmp( option_asr_lang, ""))
+			option_asr_lang = NULL;
+	}
+	/* <abs timeout> */
+	option_abs_timeout = strsep(&options, str_sep);
+	if( option_abs_timeout)
+	{
+		if( !strcmp( option_abs_timeout, ""))
+			option_abs_timeout = NULL;
+	}
+	/* <Misc options> */
+	opt = strsep(&options, str_sep);	
+	if( opt) 
+	{
+		if( strchr( opt, 'f'))
+			option_asfile = 1;/*tread text_or_file as a if it was a file*/
+		if( strchr( opt, 'a'))
+			option_answer = 1;
+		if( strchr( opt, 'n'))
+			option_no_hangup_on_verbio_err = 1;
+		if( strchr( opt, 'b'))
+			option_beep = 1;/*beep before rec */
+		if( strchr( opt, 'g'))
+		{
+			option_bargein = 1;/*bargein activated */
+			if( option_beep == 1)
+			{
+				ast_log( LOG_WARNING, "Bargein is active...I'm going to disable beep.\n");
+				/* no sense if bargein active*/
+				option_beep = 0;
+			}
+		}
+		if( strchr( opt, 'd'))
+			option_dtmf = 1; /* enable dtmf detection*/	
+		if( strchr( opt, 'i'))
+		{
+			option_interrupt = 1; /* immediate prompt interruption */
+			if( option_bargein == 0)
+			{
+				ast_log( LOG_WARNING, "Immediate interrupt is active...I'm going to enable bargein.\n");
+				/* bargein needs to be active */
+				option_bargein = 1; 
+			}
+			if( option_beep == 1)
+			{
+				ast_log( LOG_WARNING, "Bargein is active...I'm going to disable beep.\n");
+				/* no sense if bargein active*/
+				option_beep = 0;
+			}
+		}
+		if( strchr( opt, 's'))
+			option_stop_on_dtmf = 1;
+		if( strchr( opt, 'v'))
+			option_verbose = 1;
+	}
+	
+	/* ----------------------------------------------- */
+	/* ----- Get options from Verbio config file ----- */
+	/* ----------------------------------------------- */
+	vcfg = verbio_load_asterisk_config();
+	if( !vcfg) 
+	{
+		ast_log( LOG_ERROR, "Error opening configuration file %s\n", VERBIO_CFG);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+
+		return -1;
+	}
+	if( !( vcfg_primary_host = ast_variable_retrieve( vcfg, "general", "primary_vox_server"))) 
+		vcfg_primary_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_backup_host = ast_variable_retrieve( vcfg, "general", "backup_vox_server"))) 	
+		vcfg_backup_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_default_tts_lang = ast_variable_retrieve( vcfg, "tts", "default_language"))) 
+		ast_log( LOG_WARNING, "Error reading default_language option\n");
+	
+	if( !( vcfg_default_tts_spkr = ast_variable_retrieve( vcfg, "tts", "default_speaker"))) 
+		ast_log( LOG_WARNING, "Error reading default_speaker option\n");
+	
+	if( !( vcfg_tts_txt_path = ast_variable_retrieve( vcfg, "tts", "text_prompts_path"))) 
+		ast_log( LOG_WARNING, "Error reading text_prompts_path option\n");
+	
+	if( !( tmp = ast_variable_retrieve( vcfg, "tts", "init_delay"))) 
+		tmp = VERBIO_TTS_INIT_DELAY;
+	vcfg_init_delay = atoi( tmp);
+	
+	if( !( tmp = ast_variable_retrieve( vcfg, "tts", "end_delay"))) 
+		tmp = VERBIO_TTS_END_DELAY;
+	vcfg_end_delay = atoi( tmp);
+	
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "keep_synthesized_files"))) 
+		tmp = "0";
+	vcfg_keep_synthesized_files = atoi( tmp);
+	
+	if( !( vcfg_default_asr_config = ast_variable_retrieve(vcfg, "asr", "default_config"))) 
+		ast_log( LOG_WARNING, "Error reading default_config option\n");
+
+	if( !( vcfg_default_asr_lang = ast_variable_retrieve(vcfg, "asr", "default_language"))) 
+		ast_log( LOG_WARNING, "Error reading default_language option\n");
+	
+	if( !( vcfg_init_sil = ast_variable_retrieve(vcfg, "asr", "init_sil"))) 
+		vcfg_init_sil = VERBIO_INIT_SIL;
+
+	if( !( vcfg_max_sil = ast_variable_retrieve(vcfg, "asr", "max_sil"))) 
+		vcfg_max_sil = VERBIO_MAX_SIL;
+	
+	if( !( vcfg_max_ref = ast_variable_retrieve(vcfg, "asr", "max_ref"))) 
+		vcfg_max_ref = NULL;
+	
+	if( !( vcfg_min_ref = ast_variable_retrieve(vcfg, "asr", "min_ref"))) 
+		vcfg_min_ref = NULL;
+
+	if( option_interrupt)
+	{
+		vcfg_vad_mode = ast_variable_retrieve(vcfg, "vad", "mode");
+
+		if( !( vcfg_low_factor = ast_variable_retrieve(vcfg, "vad", "low_factor"))) 
+			vcfg_low_factor = NULL;
+		
+		if( !( vcfg_high_factor = ast_variable_retrieve(vcfg, "vad", "high_factor"))) 
+			vcfg_high_factor = NULL;
+		
+		if( !( vcfg_final_factor = ast_variable_retrieve(vcfg, "vad", "final_factor"))) 
+			vcfg_final_factor = NULL;
+		
+		if( !( vcfg_final_high_factor = ast_variable_retrieve(vcfg, "vad", "final_high_factor"))) 
+			vcfg_final_high_factor = NULL;
+		
+		if( !( vcfg_min_high_thresh = ast_variable_retrieve(vcfg, "vad", "min_high_thresh"))) 
+			vcfg_min_high_thresh = NULL;
+		
+		if( !( vcfg_aam_min = ast_variable_retrieve(vcfg, "vad", "aam_min"))) 
+			vcfg_aam_min = NULL;
+		
+		if( !( vcfg_aam_max = ast_variable_retrieve(vcfg, "vad", "aam_max"))) 
+			vcfg_aam_max = NULL;
+	}
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "asr", "absolute_timeout"))) 
+		tmp = VERBIO_DEF_ABS_TMOUT;
+	vcfg_absolute_timeout = atoi( tmp);
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "verbose"))) 
+		tmp = "0";
+	vcfg_verbose = atoi( tmp);
+	if( vcfg_verbose)
+	{
+		ast_log( LOG_NOTICE, "Verbose enabled in config file.\n");
+		option_verbose = 1;
+	}
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "extended_verbose"))) 
+		tmp = "0";
+	vcfg_extended_verbose = atoi( tmp);
+	
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "keep_recorded_files"))) 
+		tmp = "0";
+	vcfg_keep_recorded_files = atoi( tmp);
+	
+	vcfg_recorded_files_path = ast_variable_retrieve(vcfg, "debug", "recorded_files_path");
+
+	
+	/* ---------------------------------------------------- */
+	/* ----- Set options (to be used on voxlib calls) ----- */
+	/* ---------------------------------------------------- */
+	/* <init sil> */
+	if( !option_init_sil)
+		init_sil = atoi( vcfg_init_sil);
+	else
+		init_sil = atoi( option_init_sil);
+	/* <max sil> */
+	if( !option_max_sil)
+		max_sil = atoi( vcfg_max_sil);
+	else	
+		max_sil = atoi( option_max_sil);
+	/* <language> */
+	if( !option_tts_lang)
+		tts_lang = vcfg_default_tts_lang;
+	else
+		tts_lang = option_tts_lang;
+	/* <Speaker> */
+	if( !option_tts_spkr)
+		tts_spkr = vcfg_default_tts_spkr;
+	else	
+		tts_spkr = option_tts_spkr;
+	/* <Text to read> */
+	if( option_asfile)
+	{
+		/* <Text file> */
+		if( text_or_file[0] != '/')/*FIXME: elegance...*/
+		{	/* relative path */
+			strcpy( text_full_path, vcfg_tts_txt_path);
+			strcat( text_full_path, "/");	
+			strcat( text_full_path, text_or_file);	
+		}
+		else
+		{	/* full path */
+			strcpy( text_full_path, text_or_file);
+		}
+		text_to_synth = ast_read_textfile( text_full_path);
+	}
+	else
+	{
+		text_to_synth = text_or_file;
+	}
+	/* <ASR config> */
+	if( !option_asr_config)
+		asr_config = vcfg_default_asr_config;
+	else
+		asr_config = option_asr_config;
+	/* <ASR lang> */
+	if( !option_asr_lang)
+		asr_lang = vcfg_default_asr_lang;
+	else	
+		asr_lang = option_asr_lang;
+	/* <init sil> */
+	if( !option_init_sil)
+		init_sil = atoi( vcfg_init_sil);
+	else
+		init_sil = atoi( option_init_sil);
+	/* <max sil> */
+	if( !option_max_sil)
+		max_sil = atoi( vcfg_max_sil);
+	else	
+		max_sil = atoi( option_max_sil);
+	
+	/* <absolute timeout> */
+	if( !option_abs_timeout)
+		abs_timeout = vcfg_absolute_timeout;
+	else	
+		abs_timeout = atoi( option_abs_timeout);
+
+	/* <dev value> */
+	dev = verbio_get_dev( chan, option_verbose);
+	
+	if( option_interrupt)
+	{
+		if( vcfg_vad_mode)
+		{
+			float mfactor = 1.0;
+			if( !strcasecmp( vcfg_vad_mode, "quiet"))
+				mfactor = 1.2;
+			else if( !strcasecmp( vcfg_vad_mode, "standard"))
+				mfactor = VSTD_FACTOR;
+			else if( !strcasecmp( vcfg_vad_mode, "noisy"))
+				mfactor = VN_FACTOR;
+			else if( !strcasecmp( vcfg_vad_mode, "hysteria"))
+				mfactor = VH_FACTOR;
+			
+			low_factor = VERBIO_LOW_FACTOR * mfactor;
+			high_factor = VERBIO_HIGH_FACTOR * mfactor;	
+			final_factor = VERBIO_FINAL_FACTOR * mfactor;
+			final_high_factor = VERBIO_FINAL_HIGH_FACTOR * mfactor;
+			min_high_thresh = VERBIO_MIN_HIGH_THRESH * mfactor * 0.5;
+			aam_min = VERBIO_AAM_MIN * mfactor;
+			aam_max = VERBIO_AAM_MAX * mfactor;
+
+			/*Also modify server-side VAD params (env. noise will also affect final silence detection)*/
+			min_ref		= VERBIO_MIN_REF * mfactor * 0.5;
+			max_ref		= VERBIO_MAX_REF;
+		}
+		else
+		{
+			if( vcfg_low_factor != NULL)
+				low_factor = atof( vcfg_low_factor);
+			else
+				low_factor = VERBIO_LOW_FACTOR;
+				
+			if( vcfg_high_factor != NULL)
+				high_factor = atof( vcfg_high_factor);
+			else
+				high_factor = VERBIO_HIGH_FACTOR;
+		
+			if( vcfg_final_factor != NULL)
+				final_factor = atof( vcfg_final_factor);
+			else
+				final_factor = VERBIO_FINAL_FACTOR;
+		
+			if( vcfg_final_high_factor != NULL)
+				final_high_factor = atof( vcfg_final_high_factor);
+			else
+				final_high_factor = VERBIO_FINAL_HIGH_FACTOR;
+	
+			if( vcfg_min_high_thresh != NULL)
+				min_high_thresh = atof( vcfg_min_high_thresh);
+			else
+				min_high_thresh = VERBIO_MIN_HIGH_THRESH;
+	
+			if( vcfg_aam_min != NULL)
+				aam_min = atof( vcfg_aam_min);
+			else
+				aam_min = VERBIO_AAM_MIN;
+	
+			if( vcfg_aam_max != NULL)
+				aam_max = atof( vcfg_aam_max);
+			else
+				aam_max = VERBIO_AAM_MAX;
+		}
+	}
+	/* ---------------------------------------- */
+	/* --- Save synthesized audio options  ---- */
+	/* ---------------------------------------- */
+	if( vcfg_keep_synthesized_files)
+	{
+		char t_str[VERBIO_MAX_TSTR_SIZE];
+		time_t t = time( NULL );	
+		if( snprintf( t_str, VERBIO_MAX_TSTR_SIZE, "%d", (int)t) > VERBIO_MAX_TSTR_SIZE) 
+			ast_log( LOG_WARNING, "Filename may be truncated.\n"); 
+		strcat( filename_tts, t_str);
+		strcat( filename_tts, "-");
+		strcat( filename_tts, chan->uniqueid);
+		if( vcfg_recorded_files_path)
+		{
+			strcpy( rec_tts_file_path, vcfg_recorded_files_path);
+			strcat( rec_tts_file_path, "/");
+			strcat( rec_tts_file_path, filename_tts);
+		}
+		else
+		{
+			strcpy( rec_tts_file_path, filename_tts);
+		}
+	}
+	
+	/* ---------------------------------------- */
+	/* ----- Save recorded audio options  ----- */
+	/* ---------------------------------------- */
+	if( vcfg_keep_recorded_files)
+	{
+		char t_str[VERBIO_MAX_TSTR_SIZE];
+		time_t t = time( NULL );	
+		if( snprintf( t_str, VERBIO_MAX_TSTR_SIZE, "%d", (int)t) > VERBIO_MAX_TSTR_SIZE) 
+			ast_log( LOG_WARNING, "Filename may be truncated.\n"); 
+		strcat(filename_asr, t_str);
+		strcat(filename_asr, "-");
+		strcat(filename_asr, chan->uniqueid);
+		if( vcfg_recorded_files_path)
+		{
+			strcpy( rec_asr_file_path, vcfg_recorded_files_path);
+			strcat( rec_asr_file_path, "/");
+			strcat( rec_asr_file_path, filename_asr);
+		}
+		else
+		{
+			strcpy( rec_asr_file_path, VERBIO_DEF_REC_PATH);
+			strcat( rec_asr_file_path, filename_asr);
+		}
+	}
+
+	/* -------------------------------------- */
+	/* ------ Options set via chan vars ----- */
+	/* -------------------------------------- */
+	/* */
+	if ((tmp = pbx_builtin_getvar_helper(chan, "VERBIO_DTMF_MAXLEN")) && !ast_strlen_zero(tmp))
+		max_dtmf_len = atoi(tmp);
+
+	/* See if a terminator is specified */
+	if ((tmp = pbx_builtin_getvar_helper(chan, "VERBIO_DTMF_TERMINATOR"))) {
+		if (ast_strlen_zero(tmp))
+			dtmf_terminator = '#';/*'\0';*/
+		else
+			dtmf_terminator = tmp[0];
+	}
+	
+	if( option_verbose)
+	{
+		ast_log( LOG_NOTICE, "--------------------------\n");
+		ast_log( LOG_NOTICE, "VerbioPromptAndRec param summary:\n");
+		ast_log( LOG_NOTICE, " Prim vox srv : %s\n", vcfg_primary_host);
+		ast_log( LOG_NOTICE, " Bckp vox srv : %s\n", vcfg_backup_host);
+		ast_log( LOG_NOTICE, " TTS language : %s\n", tts_lang);
+		ast_log( LOG_NOTICE, " TTS speaker  : %s\n", tts_spkr);
+		if( option_asfile)
+			ast_log( LOG_NOTICE, " Synth from %s text file\n", text_full_path);
+		ast_log( LOG_NOTICE, " Text to synth: %s\n", text_to_synth);
+		ast_log( LOG_NOTICE, " Init delay   : %d\n", vcfg_init_delay);
+		ast_log( LOG_NOTICE, " End delay    : %d\n", vcfg_end_delay);
+		if( vcfg_keep_synthesized_files)
+			ast_log( LOG_NOTICE, " Rec TTS file      :%s.%s\n", rec_tts_file_path, EXT);
+		ast_log( LOG_NOTICE, " ASR config   : %s\n", asr_config);
+		ast_log( LOG_NOTICE, " ASR lang     : %s\n", asr_lang);
+		ast_log( LOG_NOTICE, " Init sil     : %d\n", init_sil);
+		ast_log( LOG_NOTICE, " Max  sil     : %d\n", max_sil);
+		ast_log( LOG_NOTICE, " Abs timeout  : %d\n", abs_timeout);
+		if( vcfg_max_ref)
+			ast_log( LOG_NOTICE, " Max  ref     : %f\n", atof( vcfg_max_ref));
+		if( vcfg_min_ref)
+			ast_log( LOG_NOTICE, " Min  ref     : %f\n", atof( vcfg_min_ref));
+		if( option_interrupt)
+		{
+			ast_log( LOG_NOTICE, " Client side VAD options:\n");
+			if( vcfg_vad_mode)
+				ast_log( LOG_NOTICE, " VAD in mode: %s\n", vcfg_vad_mode);
+			ast_log( LOG_NOTICE, "  low_factor\t: %f\n", low_factor);
+			ast_log( LOG_NOTICE, "  high_factor\t: %f\n", high_factor);
+			ast_log( LOG_NOTICE, "  final_factor\t: %f\n", final_factor);
+			ast_log( LOG_NOTICE, "  final_high_factor: %f\n", final_high_factor);
+			ast_log( LOG_NOTICE, "  min_high_thresh\t: %f\n", min_high_thresh);
+			ast_log( LOG_NOTICE, "  aam_min\t: %f\n", aam_min);
+			ast_log( LOG_NOTICE, "  aam_max\t: %f\n", aam_max);
+		}
+		if( option_dtmf)
+		{
+			ast_log( LOG_NOTICE, " Max dtmf len : %d\n", max_dtmf_len);
+			ast_log( LOG_NOTICE, " Dtmf term    : %c\n", dtmf_terminator);
+		}
+
+		if( vcfg_keep_recorded_files)
+			ast_log( LOG_NOTICE, " Rec ASR file      :%s.%s\n", rec_asr_file_path, EXT);
+		ast_log( LOG_NOTICE, " Voxlib device: %d\n", dev);
+		ast_log( LOG_NOTICE, "--------------------------\n");
+	}
+
+	/* ----------------------------- */
+	/* Answer the channel (if not up)*/
+	/* ----------------------------- */
+	int res = 0;
+	if( chan->_state != AST_STATE_UP) 
+	{
+		if( option_answer) 
+		{
+			res = ast_answer(chan);
+		} 
+		else 
+		{
+			/* At the user's option, skip if the line is not up */
+			ast_log(LOG_WARNING, "Not answering the channel.\n");
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;
+		}
+	}
+	
+	if( res) 
+	{
+		ast_log(LOG_WARNING, "Could not answer channel '%s'\n", chan->name);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	
+	/* ------------------ */
+	/* Set channel format */
+	/* ------------------ */
+	/* Verbio only accepts alaw ulaw and slin...we are going to use alaw*/
+	if( ast_set_write_format( chan, AUDIO_FORMAT) <  0)
+	{
+		ast_log( LOG_NOTICE, "AUDIO_FORMAT (write) failed.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	if( ast_set_read_format( chan, AUDIO_FORMAT) <  0)
+	{
+		ast_log( LOG_NOTICE, "AUDIO_FORMAT (read) failed.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	
+	/* ---------------------------------- */
+	/* ----- Verbio Rec (ASR) stuff ----- */
+	/* ---------------------------------- */
+	vox_clrrsp( &rsp);
+	rsp.maxsil = max_sil;
+	rsp.initsil = init_sil;
+
+	/* If we can not set asr config.. exit*/
+	if( vox_setparm( dev,VXCH_DEFASRCFG, asr_config) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set ASR config to %s. [%s]\n", asr_config, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+	/* If we can not set asr lang.. exit*/
+	if( vox_setparm( dev,VXCH_DEFASRLNG, asr_lang) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set ASR lang to %s. [%s]\n", asr_lang, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+
+	if( (recdev = vox_recstr_open( dev, &rsp, VERBIO_CODEC | MC_INITSIL )) == -1) 
+	{
+		ast_log(LOG_ERROR, "vox_recstr_open %d. [%s]\n", dev, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+
+	/* maxref  VAD */
+	if( vcfg_max_ref != NULL)
+	{
+		max_ref = atof( vcfg_max_ref);
+		if( max_ref > VERBIO_MAX_REF)
+			max_ref = VERBIO_MAX_REF;
+		
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "vox_setparm max_ref = %f\n", max_ref);
+		
+		if( vox_setparm( dev, VXGB_VSDMAXREF, &max_ref) == -1) 
+			ast_log( LOG_ERROR, "Error setting max_ref.\n");
+    	}
+	/* minref  VAD */
+	if( vcfg_min_ref != NULL)
+	{
+		min_ref = atof( vcfg_min_ref);
+		if( min_ref >= VERBIO_MAX_REF)
+		{
+			min_ref = VERBIO_MAX_REF * 0.8;
+			ast_log( LOG_WARNING, "(min_ref >= VERBIO_MAX_REF). min_ref set to: %f\n", min_ref);
+		}
+
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "vox_setparm min_ref = %f\n", min_ref);
+		
+		if( vox_setparm( dev, VXGB_VSDMINREF, &min_ref) == -1)
+			ast_log( LOG_ERROR, "Error setting min_ref.\n");
+	}
+
+	/* keep a copy of what user says */
+	if( vcfg_keep_recorded_files)
+	{
+		s_asr = ast_writefile( rec_asr_file_path, EXT, NULL, fflags , 0, 0644);
+		/* Let the user know which file corresponds to actual recording*/
+		pbx_builtin_setvar_helper( chan, "VASR_REC_FILE", rec_asr_file_path);
+	}	
+
+	/* ---------------------------- */
+	/* ----- Verbio VAD stuff ----- */
+	/* ---------------------------- */
+	if( option_interrupt)
+	{
+		VAD_PRM prm;
+		vox_clrvad( &prm);
+		prm.low_factor = low_factor;
+		prm.high_factor = high_factor;
+		prm.final_factor = final_factor;
+		prm.final_high_factor = final_high_factor;
+		prm.min_high_thresh = min_high_thresh;
+		prm.aam_min = aam_min;
+		prm.aam_max = aam_max;
+
+		vsddev = vox_vsd_open( dev, recdev, &prm, VERBIO_CODEC);
+		if( vsddev == (VAD_PARAM *)-1)
+		{
+			ast_log(LOG_ERROR, "vsddev\n");
+			vox_recstr_close( dev, recdev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s_asr);
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			if( option_no_hangup_on_verbio_err)
+				return 0;
+			else
+				return -1;
+		}
+	}
+
+	/* ---------------------------- */
+	/* ----- Verbio TTS stuff ----- */
+	/* ---------------------------- */
+	/* If we can not set tts lang.. exit*/
+	if( vox_setparm( dev,VXCH_DEFTTSLANG, tts_lang) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set TTS language to %s. [%s]\n", tts_lang, ATVOX_ERRMSGP( dev));
+		vox_recstr_close( dev, recdev);
+		if( vcfg_keep_recorded_files)
+			ast_closestream(s_asr);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+	/* Speaker is not critical */
+	if( vox_setparm( dev,VXCH_TTSSPKNAME, tts_spkr) == -1)
+		ast_log( LOG_WARNING, "Can not set TTS speaker to %s.\n", tts_spkr);
+
+	ssize_t synth = vox_playstr_open( dev, text_to_synth, VERBIO_CODEC);/*TODO:allow other formats? (ulaw and slin)*/
+	if( !synth)
+	{
+		ast_log( LOG_ERROR, "Fatal error on playstr_open %s\n", ATVOX_ERRMSGP( dev));
+		vox_recstr_close( dev, recdev);
+		if( vcfg_keep_recorded_files)
+			ast_closestream(s_asr);	
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+
+	/* keep a copy of synth audio */
+	if( vcfg_keep_synthesized_files)
+		s_tts = ast_writefile( rec_tts_file_path, EXT, NULL, fflags , 0, 0644);
+	
+	
+	/* --------------------------------- */
+	/* ----- Rec and Synth loop(s) ----- */
+	/* --------------------------------- */
+	/* Ensure no streams are currently running..FIXME:necessary? */
+	ast_stopstream( chan);
+	
+	/*while( ast_waitfor( chan, -1) < -1)
+		f = ast_read( chan);*/
+	/* FIXME: First samples corrupted? */
+	ast_safe_sleep( chan, vcfg_init_delay);
+	int tts_has_finished = 0;/* Synth end check */
+	
+	/* 
+	   If bargein option is not set, play our 
+	   prompt (first) and the, recognize
+	*/
+	if( !option_bargein)
+	{
+		/* Synthesis loop */
+		int mute_tts = 0;
+		while( 1)
+		{
+			waitres = ast_waitfor( chan, MAX_WAIT_TIME);
+			if( vcfg_extended_verbose)
+				ast_log(LOG_NOTICE, "Waited %d ms\n", waitres);
+
+			if( waitres < 0)
+			{
+				ast_log(LOG_NOTICE, "Wait failed.\n");
+				vox_playstr_close( dev, synth);
+				vox_recstr_close( dev, recdev);
+				if( option_interrupt)
+					vox_vsd_close( dev, vsddev);
+				if( vcfg_keep_recorded_files)
+					ast_closestream(s_asr);
+				if( vcfg_keep_synthesized_files)
+					ast_closestream(s_tts);			
+				ast_stopstream(chan);
+				#ifdef VERBIO_CLOSE_ON_HANGUP	
+				vox_devclose( dev);
+				if( option_verbose)
+					ast_log(LOG_NOTICE, "device %d closed.\n", dev);
+				#endif	
+				#if ASTERISK_VERSION_NUM < AST_4
+				LOCAL_USER_REMOVE( u);
+				#else	
+				ast_module_user_remove(u);
+				#endif
+				ast_config_destroy( vcfg);
+				return -1;	
+			}else if( waitres == 0)
+			{
+				if( vcfg_extended_verbose)
+					ast_log(LOG_NOTICE, "Wait timeout!\n");
+
+				count = vox_playstr_read( synth, samples, 8000);
+			
+				if( count < 8000)
+					break;
+	
+				continue;
+			}
+	
+			/* Read a frame... we will reuse this frame for writing.
+		   	   TODO:create a new frame...*/
+			f = ast_read( chan);
+			/* Hangup detection */
+			if( !f)
+			{
+				ast_log(LOG_NOTICE, "Hangup detected.\n");
+				vox_playstr_close( dev, synth);
+				vox_recstr_close( dev, recdev);
+				if( option_interrupt)
+					vox_vsd_close( dev, vsddev);
+				if( vcfg_keep_recorded_files)
+					ast_closestream(s_asr);
+				if( vcfg_keep_synthesized_files)
+					ast_closestream(s_tts);
+				ast_stopstream(chan);
+				
+				#ifdef VERBIO_CLOSE_ON_HANGUP	
+				vox_devclose( dev);
+				if( option_verbose)
+					ast_log(LOG_NOTICE, "device %d closed.\n", dev);
+				#endif	
+				
+				#if ASTERISK_VERSION_NUM < AST_4
+				LOCAL_USER_REMOVE( u);
+				#else	
+				ast_module_user_remove(u);
+				#endif
+				ast_config_destroy( vcfg);
+				return -1;	
+			}
+
+			if( f->frametype == AST_FRAME_VOICE) 
+			{
+				/* reuse our audio_buff to store synth audio */
+				/*TODO: avoid blocking functions */
+				count = vox_playstr_read( synth, samples, f->samples);
+
+				/* Set new samples in our frame */
+				#if ASTERISK_VERSION_NUM < AST_601 
+				f->data = samples;
+				#else
+				f->data.ptr = samples;
+				#endif
+	
+				if( vcfg_keep_synthesized_files)
+				{
+					/*Write frame to file*/
+					if( ast_writestream( s_tts, f)) 
+						ast_log(LOG_ERROR, "Error writing frame to file.\n");
+				}
+				/*ast_queue_frame( chan, f);*//* internally frees f*/
+				if( !mute_tts)
+					if( ast_write(chan, f)) /*TODO: handle this case*/
+						ast_log(LOG_ERROR, "Error writing frame to chan.\n");
+			}
+			else if( f->frametype == AST_FRAME_DTMF) 
+			{
+				if( option_dtmf)
+				{
+					if( option_stop_on_dtmf)
+						mute_tts = 1;
+
+					/* Set detected dtmf to dialplan var*/
+#if ASTERISK_VERSION_NUM >= AST_8
+					verbio_set_dtmf_result( chan, f->subclass.integer);
+#else
+					verbio_set_dtmf_result( chan, f->subclass);
+#endif
+					int dtmflen = strlen(pbx_builtin_getvar_helper( chan, "VDTMF_RESULT"));
+#if ASTERISK_VERSION_NUM >= AST_8
+					if( (dtmflen >= max_dtmf_len) || f->subclass.integer == dtmf_terminator)
+#else
+					if( (dtmflen >= max_dtmf_len) || f->subclass == dtmf_terminator)
+#endif
+					{
+						if( option_verbose)
+							ast_log(LOG_NOTICE, "DTMF max len or terminator detected during prompt.\n");
+						ast_frfree(f);
+						/*break;*/ 
+						vox_playstr_close( dev, synth);
+						vox_recstr_close( dev, recdev);
+						if( option_interrupt)
+							vox_vsd_close( dev, vsddev);
+						if( vcfg_keep_recorded_files)
+							ast_closestream(s_asr);
+						if( vcfg_keep_synthesized_files)
+							ast_closestream(s_tts);
+						ast_stopstream(chan);
+						
+						
+						#if ASTERISK_VERSION_NUM < AST_4
+						LOCAL_USER_REMOVE( u);
+						#else	
+						ast_module_user_remove(u);
+						#endif
+						ast_config_destroy( vcfg);
+						return 0;	
+					}
+				}
+			}
+			
+			/* Check if we are done */
+			if( count < f->samples)
+			{
+				ast_frfree(f);
+				break;
+			}
+			ast_frfree( f);
+		}
+
+		/* FIXME: Last samples (sometimes) corrupted? */
+		ast_safe_sleep( chan, vcfg_end_delay);
+
+		vox_playstr_close( dev, synth);
+		ast_stopstream(chan);
+		count = 0;
+	}
+
+	/* Play a beep.*/
+	if( option_beep)
+	{
+		if( !ast_streamfile( chan, "beep", chan->language)) 
+			ast_waitstream( chan, "");
+		else 
+			ast_log( LOG_WARNING, "ast_streamfile failed on %s\n", chan->name);
+		ast_stopstream( chan);
+	}
+
+	ast_stopstream( chan);
+
+	/*
+	The following loop will perform a recognition (if bargein is not active) 
+	or a recognition and synthesis -at unison- (if bargein is active)
+	*/	
+	int voice_detected = 0; /* voice detection flag */
+	/*int sample_count = 0;*/
+	time(&start);
+	while( 1)
+	{	
+		time(&current);
+		if( (current - start) >= abs_timeout)
+		{
+			ast_log(LOG_NOTICE, "Absolute timeout reached [%d seconds].\n", (int)(current - start));
+			break; 
+		}
+
+		waitres = ast_waitfor( chan, MAX_WAIT_TIME);
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "Waited %d ms\n", waitres);
+
+		if( waitres < 0)
+		{
+			ast_log(LOG_NOTICE, "Wait failed.\n");
+			vox_recstr_close( dev, recdev);
+			vox_playstr_close( dev, synth);
+			if( option_interrupt)
+				vox_vsd_close( dev, vsddev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s_asr);
+			if( vcfg_keep_synthesized_files)
+				ast_closestream(s_tts);
+			ast_stopstream(chan);
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;	
+		}else if( waitres == 0)
+		{
+			if( vcfg_extended_verbose)
+				ast_log(LOG_NOTICE, "Wait timeout!\n");
+
+			continue;
+		}
+		/* Read a frame from channel */
+		f = ast_read( chan);
+
+		if( !f)
+		{
+			ast_log(LOG_NOTICE, "Hangup detected.\n");
+			vox_recstr_close( dev, recdev);
+			vox_playstr_close( dev, synth);
+			if( option_interrupt)
+				vox_vsd_close( dev, vsddev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s_asr);
+			if( vcfg_keep_synthesized_files)
+				ast_closestream(s_tts);
+			ast_stopstream(chan);
+			
+			#ifdef VERBIO_CLOSE_ON_HANGUP	
+			vox_devclose( dev);
+			if( option_verbose)
+				ast_log(LOG_NOTICE, "device %d closed.\n", dev);
+			#endif	
+
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;	
+		}
+	
+		if( f->frametype == AST_FRAME_VOICE)
+		{
+			/* ----------------------- */
+			/* ----- Recognition ----- */
+			/* ----------------------- */
+			if( vcfg_keep_recorded_files)
+			{
+				/*Write frame to file*/
+				if( ast_writestream( s_asr, f)) 
+					ast_log(LOG_ERROR, "Error writing frame to rec file.\n");
+			}
+			
+			if( option_interrupt && voice_detected != 1)
+			{
+				/* VAD Client-side */
+				int status = 0;
+				#if ASTERISK_VERSION_NUM < AST_601 
+				status = vox_vsd_write( vsddev, f->data, f->samples);
+				#else
+				status = vox_vsd_write( vsddev, f->data.ptr, f->samples);
+				#endif 
+				
+				if( (status != VVX_INIT) && (status != VVX_SILENCE))
+				{
+					if (status != VVX_LOW) {
+						/*TODO: start absolute timeout counter here??*/
+						voice_detected = 1;
+						if( option_verbose)
+							ast_log(LOG_NOTICE, "Voice detected\n");
+					}
+					
+					#if ASTERISK_VERSION_NUM < AST_601 
+					if( vox_recstr_write( recdev, f->data, f->samples) < f->samples)
+					#else
+					if( vox_recstr_write( recdev, f->data.ptr, f->samples) < f->samples)
+					#endif 
+					{
+						ast_frfree(f);
+						break;/* Recognizer has something for us...
+							Exit while loop and set result
+							via verbio_set_asr_result function*/
+					}
+					
+				}
+
+				/* VAD (Voice Activity Detection) Server-side*/
+				/*vox_getparm( dev, VXCH_VOICEDETECTED, &voice_detected);*/
+				/*if( voice_detected == 1)
+					ast_stopstream( chan);*/
+			}
+			else 
+			{
+				/* Voice already detected */
+				/*Pass samples to recognizer and check if we are done*/
+				/*TODO: avoid blocking functions */
+				#if ASTERISK_VERSION_NUM < AST_601 
+				if( vox_recstr_write( recdev, f->data, f->samples) < f->samples)
+				#else
+				if( vox_recstr_write( recdev, f->data.ptr, f->samples) < f->samples)
+				#endif 
+				{
+					ast_frfree(f);
+					break;/* Recognizer has something for us...
+						Exit while loop and set result
+						via verbio_set_asr_result function*/
+				}
+			}	
+
+			/* ------------------------------------- */
+			/* ----- Synth (if bargein active) ----- */
+			/* ------------------------------------- */
+			if( option_bargein)
+			{	
+				if(( voice_detected != 1) && ( !tts_has_finished))
+				{
+					/* reuse our audio_buff to store synth audio */
+					/*TODO: avoid blocking functions */
+					count = vox_playstr_read( synth, samples, f->samples);
+
+					/* Set new samples in our frame */
+					#if ASTERISK_VERSION_NUM < AST_601 
+					f->data = samples;
+					#else
+					f->data.ptr = samples;
+					#endif
+		
+					if( vcfg_keep_synthesized_files)
+					{
+						/*Write frame to file*/
+						if( ast_writestream( s_tts, f)) 
+							ast_log(LOG_WARNING, "Error writing frame to file.\n");
+					}
+
+					if( ast_write(chan, f)) /*TODO: handle this case*/
+						ast_log(LOG_ERROR, "Error writing frame to chan.\n");
+				}
+				/* Check if TTS has finished */
+				if( count < f->samples)
+					tts_has_finished = 1;
+			}
+		}
+		else if( f->frametype == AST_FRAME_DTMF) 
+		{
+			if( option_dtmf)
+			{
+				/* Set detected dtmf to dialplan var*/
+#if ASTERISK_VERSION_NUM >= AST_8
+				verbio_set_dtmf_result( chan, f->subclass.integer);
+#else
+				verbio_set_dtmf_result( chan, f->subclass);
+#endif
+				int dtmflen = strlen(pbx_builtin_getvar_helper( chan, "VDTMF_RESULT"));
+#if ASTERISK_VERSION_NUM >= AST_8
+				if( (dtmflen >= max_dtmf_len) || f->subclass.integer == dtmf_terminator)
+#else
+				if( (dtmflen >= max_dtmf_len) || f->subclass == dtmf_terminator)
+#endif
+				{
+					if( option_verbose)
+						ast_log(LOG_NOTICE, "dtmf max len or terminator detected\n");
+				
+					ast_frfree(f);
+					break; 
+				}
+			}
+		}
+		else if( vcfg_extended_verbose && option_verbose)
+		{
+			ast_log(LOG_WARNING, "Ooops! Unknown frame type [%d].\n", (int)f->frametype);
+		}
+
+		ast_frfree( f);
+	}
+	ast_stopstream(chan);
+	if( vcfg_keep_recorded_files)
+		ast_closestream(s_asr);	
+	if( vcfg_keep_synthesized_files)
+		ast_closestream(s_tts);
+
+	/* Set (as channel vars) asr result(s) */
+	verbio_set_asr_result( chan, dev);
+	
+	ast_config_destroy( vcfg);
+
+	/*Voxlib cleanup*/
+	vox_recstr_close( dev, recdev);
+	vox_playstr_close( dev, synth);
+	if( option_interrupt)
+		vox_vsd_close( dev, vsddev);
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove(u);
+	#endif
+
+	
+	return 0;	
+
+}
+
+/*! \brief Stream and recognition function (implements bargein). */
+static int verbio_stream_and_rec( struct ast_channel *chan, DATA_TYPE data)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	/*
+		This function allows us to launch a stream and a recognition at 
+		the same time. As soon as the recognizer has some result for us,
+		stream will be stoped (if bargein option is active).
+	*/
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 			localuser *u;
+	#else
+	struct 			ast_module_user *u;
+	#endif
+	/* Input options */
+	char 	*options	= NULL;
+	char 	*audio_file 	= NULL;
+	char 	*args;
+	int 	argc = 0;
+	char	*argv[2];
+	char	*opt;
+	/* -- */
+	int 	option_answer 		= 0;
+	int	option_no_hangup_on_verbio_err = 0;
+	int 	option_beep 		= 0;
+	int	option_bargein 		= 0;
+	int 	option_interrupt	= 0;
+	int 	option_verbose 		= 0;
+	int 	option_dtmf		= 0;
+	int 	option_stop_on_dtmf	= 0;
+	int	abs_timeout		= atoi(VERBIO_DEF_ABS_TMOUT);
+	char 	*option_abs_timeout 	= NULL;
+	char	*option_init_sil	= NULL;
+	char 	*option_max_sil 	= NULL;
+	char	*option_asr_config 	= NULL;
+	char	*option_asr_lang 	= NULL;
+	/* Vars to store cfg file options*/
+	const char 	*vcfg_primary_host	= NULL;
+	const char 	*vcfg_backup_host	= NULL;
+	int 		vcfg_keep_recorded_files= 0;
+	int 		vcfg_extended_verbose	= 0;
+	int 		vcfg_verbose		= 0;
+	const char 	*vcfg_default_asr_config= NULL;
+	const char 	*vcfg_default_asr_lang 	= NULL;
+	const char 	*vcfg_max_sil 		= NULL;
+	const char 	*vcfg_init_sil		= NULL;
+	const char	*vcfg_recorded_files_path = NULL;
+	const char	*vcfg_max_ref		= NULL;	
+	const char 	*vcfg_min_ref		= NULL;
+	int 		vcfg_absolute_timeout 	= 0;
+	/* VAD Client-side params*/
+	const char	*vcfg_vad_mode 		= NULL;
+       	const char	*vcfg_low_factor	= NULL;
+	const char	*vcfg_high_factor	= NULL;
+	const char	*vcfg_final_factor	= NULL;
+	const char	*vcfg_final_high_factor	= NULL;
+	const char	*vcfg_min_high_thresh	= NULL;
+	const char	*vcfg_aam_min		= NULL;
+	const char	*vcfg_aam_max		= NULL;
+	/* Options to be used when dealing with voxlib*/
+	int 		dev 		= 0;
+	const char	*asr_config 	= NULL;
+	const char	*asr_lang 	= NULL;
+	ssize_t 		recdev = 0;
+	VAD_PARAM 	*vsddev = 0;
+	VX_RSP 	rsp;
+	int 	init_sil= atoi(VERBIO_INIT_SIL);
+	int 	max_sil	= atoi(VERBIO_MAX_SIL);
+	float	max_ref	= VERBIO_MAX_REF;
+	float 	min_ref	= VERBIO_MIN_REF;
+	float 	low_factor = VERBIO_LOW_FACTOR;
+	float 	high_factor = VERBIO_HIGH_FACTOR;
+	float 	final_factor = VERBIO_FINAL_FACTOR;
+	float 	final_high_factor = VERBIO_FINAL_HIGH_FACTOR;
+	float 	min_high_thresh = VERBIO_MIN_HIGH_THRESH;
+	float 	aam_min = VERBIO_AAM_MIN;
+	float 	aam_max = VERBIO_AAM_MAX;
+
+	/* Keep files */
+	const int 	fflags 			= O_CREAT|O_TRUNC|O_WRONLY;
+	struct 		ast_filestream *s_asr 	= '\0';
+	char 		filename_asr[MAXPATHLEN] 	= "verbio-rec-";
+	char 		rec_asr_file_path[MAXPATHLEN];
+	/* Helper vars*/
+	struct 		ast_frame *f;
+	char *front = NULL;
+	/*char *back = NULL;*/
+	const char 	*tmp = NULL;
+	struct 		ast_config 	*vcfg;
+	/* timeout control*/
+	time_t start, current;
+	
+	int max_dtmf_len = 1;
+	char dtmf_terminator = '#';
+	int waitres = -1;
+
+	verbio_reset_dtmf_result( chan);/* Avoid confusion among recognitions*/
+		
+	if( ast_strlen_zero(data)) 
+	{
+		ast_log( LOG_WARNING, "%s requires an argument (audio_file[|initsil][|maxsil][|asr_conf][|asr_lang][|abs_timeout][|options])\n",verbio_stream_and_rec_app);
+		return -1;
+	}
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add(chan);
+	#endif
+	
+	/* We need to make a copy of the input string if we are going to modify it! */
+	args = ast_strdupa( data);	
+	if( !args) 
+	{
+		ast_log( LOG_ERROR, "Out of memory!\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	
+	if(( argc = ast_app_separate_args( args, args_sep, argv, sizeof(argv) / sizeof(argv[0])))) 
+	{
+		audio_file = argv[0];
+		options = argv[1];
+	}
+		
+	/* --------------------------------- */
+	/* ----- Get options from user ----- */
+	/* --------------------------------- */
+	/* <init sil> */
+	option_init_sil = strsep(&options, str_sep);
+	if( option_init_sil)
+	{
+		if( !strcmp( option_init_sil, ""))
+			option_init_sil = NULL;
+	}
+	/* <max sil> */
+	option_max_sil = strsep(&options, str_sep);
+	if( option_max_sil)
+	{
+		if( !strcmp( option_max_sil, ""))
+			option_max_sil = NULL;
+	}
+	/* <ASR config> */
+	option_asr_config = strsep(&options, str_sep);
+	if( option_asr_config)
+	{
+		if( !strcmp( option_asr_config, ""))
+			option_asr_config = NULL;
+	}
+	/* <ASR lang> */
+	option_asr_lang = strsep( &options, str_sep);
+	if( option_asr_lang)
+	{
+		if( !strcmp( option_asr_lang, ""))
+			option_asr_lang = NULL;
+	}
+	/* <abs timeout> */
+	option_abs_timeout = strsep(&options, str_sep);
+	if( option_abs_timeout)
+	{
+		if( !strcmp( option_abs_timeout, ""))
+			option_abs_timeout = NULL;
+	}
+	/* <Misc options> */
+	opt = strsep(&options, str_sep);	
+	if( opt) 
+	{
+		if( strchr( opt, 'a'))
+			option_answer = 1;
+		if( strchr( opt, 'n'))
+			option_no_hangup_on_verbio_err = 1;
+		if( strchr( opt, 'b'))
+			option_beep = 1;/*beep before rec */
+		if( strchr( opt, 'g'))
+		{
+			option_bargein = 1;/*bargein activated */
+			if( option_beep == 1)
+			{
+				ast_log( LOG_WARNING, "Bargein is active...I'm going to disable beep.\n");
+				/* no sense if bargein active*/
+				option_beep = 0;
+			}
+		}
+		if( strchr( opt, 'd'))
+			option_dtmf = 1; /* enable dtmf detection*/	
+		if( strchr( opt, 'i'))
+		{
+			option_interrupt = 1; /* immediate prompt interruption */
+			if( option_bargein == 0)
+			{
+				ast_log( LOG_WARNING, "Immediate interrupt is active...I'm going to enable bargein.\n");
+				/* bargein needs to be active */
+				option_bargein = 1; 
+			}
+			if( option_beep == 1)
+			{
+				ast_log( LOG_WARNING, "Bargein is active...I'm going to disable beep.\n");
+				/* no sense if bargein active*/
+				option_beep = 0;
+			}
+		}
+		if( strchr( opt, 's'))
+			option_stop_on_dtmf = 1;
+		if( strchr( opt, 'v'))
+			option_verbose = 1;
+	}
+	
+	/* ----------------------------------------------- */
+	/* ----- Get options from Verbio config file ----- */
+	/* ----------------------------------------------- */
+	vcfg = verbio_load_asterisk_config();
+	if( !vcfg) 
+	{
+		ast_log( LOG_ERROR, "Error opening configuration file %s\n", VERBIO_CFG);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	if( !( vcfg_primary_host = ast_variable_retrieve( vcfg, "general", "primary_vox_server"))) 
+		vcfg_primary_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_backup_host = ast_variable_retrieve( vcfg, "general", "backup_vox_server"))) 	
+		vcfg_backup_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_default_asr_config = ast_variable_retrieve(vcfg, "asr", "default_config"))) 
+		ast_log( LOG_WARNING, "Error reading default_config option\n");
+
+	if( !( vcfg_default_asr_lang = ast_variable_retrieve(vcfg, "asr", "default_language"))) 
+		ast_log( LOG_WARNING, "Error reading default_language option\n");
+	
+	if( !( vcfg_init_sil = ast_variable_retrieve(vcfg, "asr", "init_sil"))) 
+		vcfg_init_sil = VERBIO_INIT_SIL;
+
+	if( !( vcfg_max_sil = ast_variable_retrieve(vcfg, "asr", "max_sil"))) 
+		vcfg_max_sil = VERBIO_MAX_SIL;
+	
+	if( !( vcfg_max_ref = ast_variable_retrieve(vcfg, "asr", "max_ref"))) 
+		vcfg_max_ref = NULL;
+	
+	if( !( vcfg_min_ref = ast_variable_retrieve(vcfg, "asr", "min_ref"))) 
+		vcfg_min_ref = NULL;
+
+	if( option_interrupt)
+	{
+		vcfg_vad_mode = ast_variable_retrieve(vcfg, "vad", "mode");
+
+		if( !( vcfg_low_factor = ast_variable_retrieve(vcfg, "vad", "low_factor"))) 
+			vcfg_low_factor = NULL;
+		
+		if( !( vcfg_high_factor = ast_variable_retrieve(vcfg, "vad", "high_factor"))) 
+			vcfg_high_factor = NULL;
+		
+		if( !( vcfg_final_factor = ast_variable_retrieve(vcfg, "vad", "final_factor"))) 
+			vcfg_final_factor = NULL;
+		
+		if( !( vcfg_final_high_factor = ast_variable_retrieve(vcfg, "vad", "final_high_factor"))) 
+			vcfg_final_high_factor = NULL;
+		
+		if( !( vcfg_min_high_thresh = ast_variable_retrieve(vcfg, "vad", "min_high_thresh"))) 
+			vcfg_min_high_thresh = NULL;
+		
+		if( !( vcfg_aam_min = ast_variable_retrieve(vcfg, "vad", "aam_min"))) 
+			vcfg_aam_min = NULL;
+		
+		if( !( vcfg_aam_max = ast_variable_retrieve(vcfg, "vad", "aam_max"))) 
+			vcfg_aam_max = NULL;
+	}
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "asr", "absolute_timeout"))) 
+		tmp = VERBIO_DEF_ABS_TMOUT;
+	vcfg_absolute_timeout = atoi( tmp);
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "verbose"))) 
+		tmp = "0";
+	vcfg_verbose = atoi( tmp);
+	if( vcfg_verbose)
+	{
+		ast_log( LOG_NOTICE, "Verbose enabled in config file.\n");
+		option_verbose = 1;
+	}
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "extended_verbose"))) 
+		tmp = "0";
+	vcfg_extended_verbose = atoi( tmp);
+	
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "keep_recorded_files"))) 
+		tmp = "0";
+	vcfg_keep_recorded_files = atoi( tmp);
+	
+	vcfg_recorded_files_path = ast_variable_retrieve(vcfg, "debug", "recorded_files_path");
+
+	
+	/* ---------------------------------------------------- */
+	/* ----- Set options (to be used on voxlib calls) ----- */
+	/* ---------------------------------------------------- */
+	/* <init sil> */
+	if( !option_init_sil)
+		init_sil = atoi( vcfg_init_sil);
+	else
+		init_sil = atoi( option_init_sil);
+	/* <max sil> */
+	if( !option_max_sil)
+		max_sil = atoi( vcfg_max_sil);
+	else	
+		max_sil = atoi( option_max_sil);
+	/* <ASR config> */
+	if( !option_asr_config)
+		asr_config = vcfg_default_asr_config;
+	else
+		asr_config = option_asr_config;
+	/* <ASR lang> */
+	if( !option_asr_lang)
+		asr_lang = vcfg_default_asr_lang;
+	else	
+		asr_lang = option_asr_lang;
+	/* <init sil> */
+	if( !option_init_sil)
+		init_sil = atoi( vcfg_init_sil);
+	else
+		init_sil = atoi( option_init_sil);
+	/* <max sil> */
+	if( !option_max_sil)
+		max_sil = atoi( vcfg_max_sil);
+	else	
+		max_sil = atoi( option_max_sil);
+	
+	/* <absolute timeout> */
+	if( !option_abs_timeout)
+		abs_timeout = vcfg_absolute_timeout;
+	else	
+		abs_timeout = atoi( option_abs_timeout);
+
+	/* <dev value> */
+	dev = verbio_get_dev( chan, option_verbose);
+
+	/* Client-side VAD options */
+	if( option_interrupt)
+	{
+		if( vcfg_vad_mode)
+		{
+			float mfactor = 1.0;
+			if( !strcasecmp( vcfg_vad_mode, "quiet"))
+				mfactor = 1.2;
+			else if( !strcasecmp( vcfg_vad_mode, "standard"))
+				mfactor = VSTD_FACTOR;
+			else if( !strcasecmp( vcfg_vad_mode, "noisy"))
+				mfactor = VN_FACTOR;
+			else if( !strcasecmp( vcfg_vad_mode, "hysteria"))
+				mfactor = VH_FACTOR;
+			
+			low_factor = VERBIO_LOW_FACTOR * mfactor;
+			high_factor = VERBIO_HIGH_FACTOR * mfactor;	
+			final_factor = VERBIO_FINAL_FACTOR * mfactor;
+			final_high_factor = VERBIO_FINAL_HIGH_FACTOR * mfactor;
+			min_high_thresh = VERBIO_MIN_HIGH_THRESH * mfactor * 0.5;
+			aam_min = VERBIO_AAM_MIN * mfactor;
+			aam_max = VERBIO_AAM_MAX * mfactor;
+			/*Also modify server-side VAD params (env. noise will also affect final silence detection)*/
+			min_ref		= VERBIO_MIN_REF * mfactor * 0.5;
+			max_ref		= VERBIO_MAX_REF;
+		}
+		else
+		{
+			if( vcfg_low_factor != NULL)
+				low_factor = atof( vcfg_low_factor);
+			else
+				low_factor = VERBIO_LOW_FACTOR;
+				
+			if( vcfg_high_factor != NULL)
+				high_factor = atof( vcfg_high_factor);
+			else
+				high_factor = VERBIO_HIGH_FACTOR;
+		
+			if( vcfg_final_factor != NULL)
+				final_factor = atof( vcfg_final_factor);
+			else
+				final_factor = VERBIO_FINAL_FACTOR;
+		
+			if( vcfg_final_high_factor != NULL)
+				final_high_factor = atof( vcfg_final_high_factor);
+			else
+				final_high_factor = VERBIO_FINAL_HIGH_FACTOR;
+	
+			if( vcfg_min_high_thresh != NULL)
+				min_high_thresh = atof( vcfg_min_high_thresh);
+			else
+				min_high_thresh = VERBIO_MIN_HIGH_THRESH;
+	
+			if( vcfg_aam_min != NULL)
+				aam_min = atof( vcfg_aam_min);
+			else
+				aam_min = VERBIO_AAM_MIN;
+	
+			if( vcfg_aam_max != NULL)
+				aam_max = atof( vcfg_aam_max);
+			else
+				aam_max = VERBIO_AAM_MAX;
+		}
+	}
+	
+	/* ---------------------------------------- */
+	/* ----- Save recorded audio options  ----- */
+	/* ---------------------------------------- */
+	if( vcfg_keep_recorded_files)
+	{
+		char t_str[VERBIO_MAX_TSTR_SIZE];
+		time_t t = time( NULL );	
+		if( snprintf( t_str, VERBIO_MAX_TSTR_SIZE, "%d", (int)t) > VERBIO_MAX_TSTR_SIZE) 
+			ast_log( LOG_WARNING, "Filename may be truncated.\n"); 
+		strcat(filename_asr, t_str);
+		strcat(filename_asr, "-");
+		strcat(filename_asr, chan->uniqueid);
+		if( vcfg_recorded_files_path)
+		{
+			strcpy( rec_asr_file_path, vcfg_recorded_files_path);
+			strcat( rec_asr_file_path, "/");
+			strcat( rec_asr_file_path, filename_asr);
+		}
+		else
+		{
+			strcpy( rec_asr_file_path, VERBIO_DEF_REC_PATH);
+			strcat( rec_asr_file_path, filename_asr);	
+		}
+	}
+
+	/* -------------------------------------- */
+	/* ------ Options set via chan vars ----- */
+	/* -------------------------------------- */
+	/* */
+	if ((tmp = pbx_builtin_getvar_helper(chan, "VERBIO_DTMF_MAXLEN")) && !ast_strlen_zero(tmp))
+		max_dtmf_len = atoi(tmp);
+
+	/* See if a terminator is specified */
+	if ((tmp = pbx_builtin_getvar_helper(chan, "VERBIO_DTMF_TERMINATOR"))) {
+		if (ast_strlen_zero(tmp))
+			dtmf_terminator = '#';/*'\0';*/
+		else
+			dtmf_terminator = tmp[0];
+	}
+
+	if( option_verbose)
+	{
+		ast_log( LOG_NOTICE, "---------------------------------\n");
+		ast_log( LOG_NOTICE, "VerbioStreamAndRec param summary:\n");
+		ast_log( LOG_NOTICE, " Prim vox srv : %s\n", vcfg_primary_host);
+		ast_log( LOG_NOTICE, " Bckp vox srv : %s\n", vcfg_backup_host);
+		ast_log( LOG_NOTICE, " File to play : %s\n", audio_file);
+		ast_log( LOG_NOTICE, " ASR config   : %s\n", asr_config);
+		ast_log( LOG_NOTICE, " ASR lang     : %s\n", asr_lang);
+		ast_log( LOG_NOTICE, " Init sil     : %d\n", init_sil);
+		ast_log( LOG_NOTICE, " Max  sil     : %d\n", max_sil);
+		ast_log( LOG_NOTICE, " Abs timeout  : %d\n", abs_timeout);
+		if( vcfg_max_ref)
+			ast_log( LOG_NOTICE, " Max  ref     : %f\n", atof( vcfg_max_ref));
+		if( vcfg_min_ref)
+			ast_log( LOG_NOTICE, " Min  ref     : %f\n", atof( vcfg_min_ref));
+		if( option_interrupt)
+		{
+			ast_log( LOG_NOTICE, " Client side VAD options:\n");
+			if( vcfg_vad_mode)
+				ast_log( LOG_NOTICE, " VAD in mode: %s\n", vcfg_vad_mode);
+			ast_log( LOG_NOTICE, "  low_factor\t: %f\n", low_factor);
+			ast_log( LOG_NOTICE, "  high_factor\t: %f\n", high_factor);
+			ast_log( LOG_NOTICE, "  final_factor\t: %f\n", final_factor);
+			ast_log( LOG_NOTICE, "  final_high_factor: %f\n", final_high_factor);
+			ast_log( LOG_NOTICE, "  min_high_thresh\t: %f\n", min_high_thresh);
+			ast_log( LOG_NOTICE, "  aam_min\t: %f\n", aam_min);
+			ast_log( LOG_NOTICE, "  aam_max\t: %f\n", aam_max);
+		}
+		if( option_dtmf)
+		{
+			ast_log( LOG_NOTICE, " Max dtmf len : %d\n", max_dtmf_len);
+			ast_log( LOG_NOTICE, " Dtmf term    : %c\n", dtmf_terminator);
+		}
+
+		if( vcfg_keep_recorded_files)
+			ast_log( LOG_NOTICE, " Rec ASR file      :%s.%s\n", rec_asr_file_path, EXT);
+		ast_log( LOG_NOTICE, " Voxlib device: %d\n", dev);
+		ast_log( LOG_NOTICE, "---------------------------------\n");
+	}
+
+	/* ----------------------------- */
+	/* Answer the channel (if not up)*/
+	/* ----------------------------- */
+	int res = 0;
+	if( chan->_state != AST_STATE_UP) 
+	{
+		if( option_answer) 
+		{
+			res = ast_answer(chan);
+		} 
+		else 
+		{
+			/* At the user's option, skip if the line is not up */
+			ast_log(LOG_WARNING, "Not answering the channel.\n");
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;
+		}
+	}
+	
+	if( res) 
+	{
+		ast_log(LOG_WARNING, "Could not answer channel '%s'\n", chan->name);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	
+	/* ------------------ */
+	/* Set channel format */
+	/* ------------------ */
+	/* Verbio only accepts alaw ulaw and slin...*/
+	if( ast_set_write_format( chan, AUDIO_FORMAT) <  0)
+	{
+		ast_log( LOG_NOTICE, "AUDIO_FORMAT (write) failed.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	if( ast_set_read_format( chan, AUDIO_FORMAT) <  0)
+	{
+		ast_log( LOG_NOTICE, "AUDIO_FORMAT (read) failed.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+	
+	/* ---------------------------------- */
+	/* ----- Verbio Rec (ASR) stuff ----- */
+	/* ---------------------------------- */
+	vox_clrrsp( &rsp);
+	rsp.maxsil = max_sil;
+	rsp.initsil = init_sil;
+
+	/* If we can not set asr config.. exit*/
+	if( vox_setparm( dev,VXCH_DEFASRCFG, asr_config) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set ASR config to %s. [%s]\n", asr_config, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+	/* If we can not set asr lang.. exit*/
+	if( vox_setparm( dev,VXCH_DEFASRLNG, asr_lang) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set ASR lang to %s. [%s]\n", asr_lang, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+
+	if( (recdev = vox_recstr_open( dev, &rsp, VERBIO_CODEC | MC_INITSIL )) == -1) 
+	{
+		ast_log(LOG_ERROR, "vox_recstr_open %d. [%s]\n", dev, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+
+	/* maxref  VAD */
+	if( vcfg_max_ref != NULL)
+	{
+		max_ref = atof( vcfg_max_ref);
+		if( max_ref > VERBIO_MAX_REF)
+			max_ref = VERBIO_MAX_REF;
+		
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "vox_setparm max_ref = %f\n", max_ref);
+		
+		if( vox_setparm( dev, VXGB_VSDMAXREF, &max_ref) == -1) 
+			ast_log( LOG_ERROR, "Error setting max_ref.\n");
+    	}
+	/* minref  VAD */
+	if( vcfg_min_ref != NULL)
+	{
+		min_ref = atof( vcfg_min_ref);
+		if( min_ref >= VERBIO_MAX_REF)
+		{
+			min_ref = VERBIO_MAX_REF * 0.8;
+			ast_log( LOG_WARNING, "(min_ref >= VERBIO_MAX_REF). min_ref set to: %f\n", min_ref);
+		}
+		
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "vox_setparm min_ref = %f\n", min_ref);
+		
+		if( vox_setparm( dev, VXGB_VSDMINREF, &min_ref) == -1)
+			ast_log( LOG_ERROR, "Error setting min_ref.\n");
+	}
+
+	/* keep a copy of what user says */
+	if( vcfg_keep_recorded_files)
+	{
+		s_asr = ast_writefile( rec_asr_file_path, EXT, NULL, fflags , 0, 0644);
+		/* Let the user know which file corresponds to actual recording*/
+		pbx_builtin_setvar_helper( chan, "VASR_REC_FILE", rec_asr_file_path);
+	}
+	
+	/* ---------------------------- */
+	/* ----- Verbio VAD stuff ----- */
+	/* ---------------------------- */
+	if( option_interrupt)
+	{
+		VAD_PRM prm;
+		vox_clrvad( &prm);
+		prm.low_factor = low_factor;
+		prm.high_factor = high_factor;
+		prm.final_factor = final_factor;
+		prm.final_high_factor = final_high_factor;
+		prm.min_high_thresh = min_high_thresh;
+		prm.aam_min = aam_min;
+		prm.aam_max = aam_max;
+
+		vsddev = vox_vsd_open( dev, recdev, &prm, VERBIO_CODEC);
+		if( vsddev == (VAD_PARAM *)-1)
+		{
+			ast_log(LOG_ERROR, "vsddev\n");
+			vox_recstr_close( dev, recdev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s_asr);
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			if( option_no_hangup_on_verbio_err)
+				return 0;
+			else
+				return -1;
+		}
+	}
+
+	/* ---------------------------------- */
+	/* ----- Rec and stream loop(s) ----- */
+	/* ---------------------------------- */
+	/* Ensure no streams are currently running..FIXME:necessary? */
+	ast_stopstream( chan);
+	
+	/* Stream file */
+	front = audio_file;
+	res = ast_streamfile( chan, front, chan->language);
+	if( res)
+	{
+		ast_log(LOG_WARNING, "ast_streamfile failed on %s for %s\n", chan->name, (char *)front);
+		vox_recstr_close( dev, recdev);
+		if( vcfg_keep_recorded_files)
+			ast_closestream(s_asr);
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+
+	if( !option_bargein)
+	{
+		if( option_dtmf)
+		{
+			if( option_verbose)
+				ast_log(LOG_NOTICE, "Waiting for digit...\n");
+			
+			res = ast_waitstream(chan, AST_DIGIT_ANY);
+
+			int rtimeout = 0;
+			while( res && !rtimeout)
+			{
+				verbio_set_dtmf_result( chan, res);
+				int dtmflen = strlen(pbx_builtin_getvar_helper( chan, "VDTMF_RESULT"));
+				
+				if( (dtmflen >= max_dtmf_len) || ( res == dtmf_terminator))
+				{
+					if( option_verbose)
+						ast_log(LOG_NOTICE, "dtmf max len or terminator detected\n");
+					
+					vox_recstr_close( dev, recdev);
+					if( option_interrupt)
+						vox_vsd_close( dev, vsddev);
+					if( vcfg_keep_recorded_files)
+						ast_closestream(s_asr);
+					
+					ast_stopstream(chan);
+					
+					#if ASTERISK_VERSION_NUM < AST_4
+					LOCAL_USER_REMOVE( u);
+					#else	
+					ast_module_user_remove(u);
+					#endif
+					ast_config_destroy( vcfg);
+					
+					return 0;
+				}
+				if( option_stop_on_dtmf)
+				{
+					/*ast_seekstream(chan->stream, 0, SEEK_SET);*/
+					ast_stopstream( chan);
+					time(&start);
+					for( ;;)
+					{
+						/*res = ast_waitstream(chan, AST_DIGIT_ANY);*/
+						res = ast_waitfordigit(chan, 1000);
+						if( res)
+							break;
+
+						time(&current);
+						if( (current - start) >= abs_timeout)
+						{
+							ast_log(LOG_NOTICE, "Absolute timeout reached [%d seconds].\n", (int)(current - start));
+							rtimeout = 1;
+							break; 
+						}
+					}
+				}
+				else
+					res = ast_waitstream(chan, AST_DIGIT_ANY);
+			}
+		}
+
+		/* Wait for audio stream to finish */
+		res = ast_waitstream(chan, "");	
+		if( res)
+		{
+			ast_log(LOG_WARNING, "ast_waitstream failed on %s \n", chan->name);
+			vox_recstr_close( dev, recdev);
+			if( option_interrupt)
+				vox_vsd_close( dev, vsddev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s_asr);
+			ast_config_destroy( vcfg);
+			return -1;	
+		}
+		
+		if( option_beep)
+		{
+			/* Some code to play a nice little beep to signify the start of the record operation */
+			if( !ast_streamfile( chan, "beep", chan->language)) 
+				ast_waitstream( chan, "");
+			else 
+				ast_log( LOG_WARNING, "ast_streamfile failed on %s\n", chan->name);
+		}
+		ast_stopstream(chan);
+	}
+
+	/* Recognition loop */
+	int voice_detected = 0; /*voice detection flag*/
+	/*int sample_count = 0;*/
+	time(&start);
+	while( 1)
+	{
+		time(&current);
+		if( (current - start) >= abs_timeout)
+		{
+			ast_log(LOG_NOTICE, "Absolute timeout reached [%d seconds].\n", (int)(current - start));
+			break; 
+		}
+
+		if( option_bargein)
+			res = ast_sched_wait(chan->sched);
+		else
+			res = -1;
+		waitres = ast_waitfor( chan, MAX_WAIT_TIME);
+		if( vcfg_extended_verbose)
+			ast_log(LOG_NOTICE, "Waited %d ms\n", waitres);
+
+		if( waitres < 0)
+		{
+			ast_log(LOG_ERROR, "Wait failed.\n");
+			vox_recstr_close( dev, recdev);
+			if( option_interrupt)
+				vox_vsd_close( dev, vsddev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s_asr);
+			ast_stopstream(chan);
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;
+		}else if( waitres == 0)
+		{
+			if( vcfg_extended_verbose)
+				ast_log(LOG_NOTICE, "Wait timeout!\n");
+
+			continue;
+		}
+
+		f = ast_read(chan);
+		if( !f) 
+		{
+			ast_log( LOG_NOTICE, "Hangup detected.\n");
+			vox_recstr_close( dev, recdev);
+			if( option_interrupt)
+				vox_vsd_close( dev, vsddev);
+			if( vcfg_keep_recorded_files)
+				ast_closestream(s_asr);
+			ast_stopstream(chan);
+
+			#ifdef VERBIO_CLOSE_ON_HANGUP	
+			vox_devclose( dev);
+			if( option_verbose)
+				ast_log(LOG_NOTICE, "device %d closed.\n", dev);
+			#endif	
+
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			ast_config_destroy( vcfg);
+			return -1;
+		} 
+
+#if ASTERISK_VERSION_NUM >= AST_8
+		if(( f->frametype == AST_FRAME_VOICE) && ( f->subclass.integer == AUDIO_FORMAT)) 
+#else
+		if(( f->frametype == AST_FRAME_VOICE) && ( f->subclass == AUDIO_FORMAT)) 
+#endif
+		{
+			/* Write frame to file */
+			if( vcfg_keep_recorded_files)
+			{
+				if( ast_writestream( s_asr, f)) 
+					ast_log(LOG_WARNING, "Error writing frame to rec file.\n");
+			}
+
+			if( option_interrupt && voice_detected != 1)
+			{
+				int status = 0;
+				#if ASTERISK_VERSION_NUM < AST_601 
+				status = vox_vsd_write( vsddev, f->data, f->samples);
+				#else
+				status = vox_vsd_write( vsddev, f->data.ptr, f->samples);
+				#endif
+				
+				if( (status != VVX_INIT) && (status != VVX_SILENCE))
+				{
+					if (status != VVX_LOW) {
+						/*TODO: start absolute timeout counter here???*/
+						voice_detected = 1;
+						ast_stopstream( chan);
+						if( option_verbose)
+							ast_log(LOG_NOTICE, "Voice detected\n");
+					}
+					
+					#if ASTERISK_VERSION_NUM < AST_601 
+					if( vox_recstr_write( recdev, f->data, f->samples) < f->samples)
+					#else
+					if( vox_recstr_write( recdev, f->data.ptr, f->samples) < f->samples)
+					#endif
+					{
+						ast_log(LOG_NOTICE, "Recognizer has something for us...\n");
+						ast_frfree(f);
+						break;/* Recognizer has something for us...
+							Exit while loop and set result
+							via verbio_set_asr_result function*/
+					}
+				}
+				/* do VAD (Voice Activity Detection) */
+				/*vox_getparm( dev, VXCH_VOICEDETECTED, &voice_detected);*/
+				/*if( voice_detected == 1)
+				ast_stopstream( chan);*/
+			}
+			else 
+			{
+				/* Voice already detected */
+				/*Pass samples to recognizer and check if we are done*/
+				/*TODO: avoid blocking functions */
+				#if ASTERISK_VERSION_NUM < AST_601 
+				if( vox_recstr_write( recdev, f->data, f->samples) < f->samples)
+				#else
+				if( vox_recstr_write( recdev, f->data.ptr, f->samples) < f->samples)
+				#endif
+				{
+					ast_log(LOG_NOTICE, "Recognizer has something for us...\n");
+					ast_frfree(f);
+					break;/* Recognizer has something for us...
+						Exit while loop and set result
+						via verbio_set_asr_result function*/
+				}
+			}
+		}
+		else if( f->frametype == AST_FRAME_DTMF) 
+		{
+			if( option_dtmf)
+			{
+				/* Set detected dtmf to dialplan var*/
+#if ASTERISK_VERSION_NUM >= AST_8
+				verbio_set_dtmf_result( chan, f->subclass.integer);
+#else
+				verbio_set_dtmf_result( chan, f->subclass);
+#endif
+				int dtmflen = strlen(pbx_builtin_getvar_helper( chan, "VDTMF_RESULT"));
+#if ASTERISK_VERSION_NUM >= AST_8
+				if( (dtmflen >= max_dtmf_len) || f->subclass.integer == dtmf_terminator)
+#else
+				if( (dtmflen >= max_dtmf_len) || f->subclass == dtmf_terminator)
+#endif
+				{
+					if( option_verbose)
+						ast_log(LOG_NOTICE, "dtmf max len or terminator detected\n");
+				
+					ast_frfree(f);
+					break;
+				}
+			}
+		}
+		else if( vcfg_extended_verbose && option_verbose)
+		{
+			ast_log(LOG_WARNING, "Ooops! Unknown frame type [%d].\n", (int)f->frametype);
+		}
+
+		ast_frfree(f);
+		
+		if( option_bargein)
+			ast_sched_runq(chan->sched);
+	}
+	ast_stopstream( chan);
+	if( vcfg_keep_recorded_files)
+		ast_closestream(s_asr);	
+
+	/* Set (as channel vars) asr result(s) */
+	verbio_set_asr_result( chan, dev);
+
+	ast_config_destroy( vcfg);
+
+	/* Voxlib cleanup */
+	vox_recstr_close( dev, recdev);
+	if( option_interrupt)
+		vox_vsd_close( dev, vsddev);
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove(u);
+	#endif
+
+	
+	return 0;	
+
+}
+
+/*! \brief Load vocabulary. This app must be called prior to any recognition. */
+static int verbio_load_vcb( struct ast_channel *chan, DATA_TYPE data)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 			localuser *u;
+	#else
+	struct 			ast_module_user *u;
+	#endif
+	/* Options */
+	char 		*args;
+	int 		argc = 0;
+	char 		*argv[3];
+	struct ast_config *vcfg;
+	char		*options 		= NULL;
+	char		*opt			= NULL;
+	int		option_no_hangup_on_verbio_err = 0;
+	int 		option_verbose 		= 0;
+	char		*option_asr_config 	= NULL;
+	char		*option_asr_lang 	= NULL;
+	int 		vcfg_verbose		= 0;
+	const char 	*vcfg_default_asr_config= NULL;
+	const char 	*vcfg_default_asr_lang 	= NULL;
+	/* Options to be used when dealing with voxlib */
+	const char 	*vcfg_primary_host	= NULL;
+	const char 	*vcfg_backup_host	= NULL;
+	int 		dev 		= 0;
+	char 		gram_full_path[MAXPATHLEN];
+	const char	*asr_config 	= NULL;
+	const char	*asr_lang 	= NULL;
+	int		nind		= 0;
+	int 		setmode 	= GVX_ISOLATED;/*GVX_ABNF/GVX_ISOLATED/GVX_CONNECTED*/
+	int 		vc_handle 	= 0; /* Vocabulary id */
+	int 		builtin_grammar = 0;
+	int 		vvi_grammar = 0;
+	/* Misc vars */
+	const char 	*grammar_path	= NULL;
+	char 		*gram_file	= NULL;
+	char 		*gram_type 	= NULL;
+	const char 	*tmp		= NULL;
+	
+	char 		gram_cache_full_path[MAXPATHLEN];
+	int 		cache_grammar_exists = 0;
+	
+	
+	if( ast_strlen_zero(data)) 
+	{
+		ast_log(LOG_WARNING, "%s requires an argument (gram_file|gram_type|[config]|[lang]|[options])\n",verbio_load_vcb_app);
+		return -1;
+	}
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add(chan);
+	#endif
+	
+	/* We need to make a copy of the input string if we are going to modify it! */
+	args = ast_strdupa(data);	
+	if( !args) 
+	{
+		ast_log(LOG_ERROR, "Out of memory!\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+
+	if(( argc = ast_app_separate_args(args, args_sep, argv, sizeof(argv) / sizeof(argv[0])))) 
+	{
+		gram_file = argv[0];
+		gram_type = argv[1];
+		options	  = argv[2];
+	}
+
+	if( ast_strlen_zero( gram_file) && ast_strlen_zero( gram_type)) 
+	{
+		ast_log(LOG_ERROR, "Check input parameters.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+
+	}	
+
+	/* --------------------------------- */
+	/* ----- Get options from user ----- */
+	/* --------------------------------- */
+	/* <ASR config> */
+	option_asr_config = strsep(&options, str_sep);
+	if( option_asr_config)
+	{
+		if( !strcmp( option_asr_config, ""))
+			option_asr_config = NULL;
+	}
+	/* <ASR lang> */
+	option_asr_lang = strsep(&options, str_sep);
+	if( option_asr_lang)
+	{
+		if( !strcmp( option_asr_lang, ""))
+			option_asr_lang = NULL;
+	}
+	/* <Misc options> */
+	opt = strsep(&options, str_sep);	
+	if( opt) 
+	{
+		if( strchr( opt, 'v'))
+			option_verbose = 1;
+		if( strchr( opt, 'n'))
+			option_no_hangup_on_verbio_err = 1;
+	}
+
+
+	/* ----------------------------------------------- */
+	/* ----- Get options from Verbio config file ----- */
+	/* ----------------------------------------------- */
+	vcfg = verbio_load_asterisk_config();
+	if( !vcfg) 
+	{
+		ast_log(LOG_WARNING, "Error opening configuration file %s\n", VERBIO_CFG);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	if( !( vcfg_primary_host = ast_variable_retrieve(vcfg, "general", "primary_vox_server"))) 
+		vcfg_primary_host = VERBIO_DEF_HOST;
+
+	if( !( vcfg_backup_host = ast_variable_retrieve(vcfg, "general", "backup_vox_server"))) 	
+		vcfg_backup_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_default_asr_config = ast_variable_retrieve(vcfg, "asr", "default_config"))) 
+		ast_log( LOG_WARNING, "Error reading default_config option\n");
+
+	if( !( vcfg_default_asr_lang = ast_variable_retrieve(vcfg, "asr", "default_language"))) 
+		ast_log( LOG_WARNING, "Error reading default_language option\n");
+
+	if( !( grammar_path = ast_variable_retrieve(vcfg, "asr", "grammar_path"))) 
+		ast_log( LOG_WARNING, "Error reading grammar_path option\n");
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "verbose"))) 
+		tmp = "0";
+	vcfg_verbose = atoi( tmp);
+	if( vcfg_verbose)
+	{
+		ast_log( LOG_NOTICE, "Verbose enabled in config file.\n");
+		option_verbose = 1;
+	}
+	/* ---------------------------------------------------- */
+	/* ----- Set options (to be used on voxlib calls) ----- */
+	/* ---------------------------------------------------- */
+	/* <ASR config> */
+	if( !option_asr_config)
+		asr_config = vcfg_default_asr_config;
+	else
+		asr_config = option_asr_config;
+	/* <ASR lang> */
+	if( !option_asr_lang)
+		asr_lang = vcfg_default_asr_lang;
+	else	
+		asr_lang = option_asr_lang;
+	
+	/* <Grammar type ISOLATED or ABNF> */	
+	/*TODO: be more 'elegant'...*/ 
+	if( toupper( gram_type[0]) == 'I') /* Isolated */
+		setmode = GVX_ISOLATED;
+	else if( toupper( gram_type[0]) == 'C') /* Connected */
+		setmode = GVX_CONNECTED;
+	else if( toupper( gram_type[0]) == 'A') /* ABNF */
+		setmode = GVX_ABNF;
+	else if( toupper( gram_type[0]) == 'B') /* Builtin */
+//DELETED: 2017-03-15
+//#if defined(__x86_64__)
+//	{
+//		ast_log( LOG_ERROR, " Builtin grammars not supported on this platform. Load your builtin in an ABNF grammar.\n");
+//		#if ASTERISK_VERSION_NUM < AST_4
+//		LOCAL_USER_REMOVE( u);
+//		#else	
+//		ast_module_user_remove(u);
+//		#endif
+//		ast_config_destroy( vcfg);
+//		return -1;
+//	}
+//#else
+//DELETED: 2017-03-15
+		{setmode = GVX_ABNF; builtin_grammar = 1;}
+//DELETED: 2017-03-15
+//#endif
+//DELETED: 2017-03-15
+	else if( toupper( gram_type[0]) == 'V') /* vvi */
+		{setmode = GVX_VVI; vvi_grammar = 1;}
+	else
+		ast_log( LOG_WARNING, " Unknown grammar type : %s. Using Isolated mode.\n", gram_type);
+	
+	/* <Grammar file> */
+	if( (gram_file[0] != '/') && (!builtin_grammar) && (!vvi_grammar))
+	{	
+		strcpy( gram_full_path, grammar_path);
+		strcat( gram_full_path, "/");	
+		strcat( gram_full_path, gram_file);	
+	}
+	else
+	{
+		strcpy( gram_full_path, gram_file);
+	}
+
+	/* <dev value> */
+	dev = verbio_get_dev( chan, option_verbose);
+
+	if( option_verbose)
+	{
+		ast_log( LOG_NOTICE, "--------------------------\n");
+		ast_log( LOG_NOTICE, "VerbioLoadVcb param summary:\n");
+		ast_log( LOG_NOTICE, " Prim vox srv : %s\n", vcfg_primary_host);
+		ast_log( LOG_NOTICE, " Bckp vox srv : %s\n", vcfg_backup_host);
+		ast_log( LOG_NOTICE, " Gram path    : %s\n", gram_full_path);
+		ast_log( LOG_NOTICE, " ASR config   : %s\n", asr_config);
+		ast_log( LOG_NOTICE, " ASR lang     : %s\n", asr_lang);
+		if( setmode == GVX_ISOLATED)
+			ast_log(LOG_NOTICE, " Grammar type: ISOLATED\n");
+		else if( setmode == GVX_CONNECTED)
+			ast_log(LOG_NOTICE, " Grammar type: CONNECTED\n");
+		else if( setmode == GVX_ABNF)
+		{
+			if( builtin_grammar) /* Builtin */
+				ast_log(LOG_NOTICE, " Grammar type: ABNF / BUILT-IN\n");
+			else
+				ast_log(LOG_NOTICE, " Grammar type: ABNF\n");
+		}
+		else if( setmode == GVX_VVI)
+			ast_log(LOG_NOTICE, " Grammar type: VVI\n");
+		else
+			ast_log(LOG_WARNING, " Unknown grammar type!\n");
+		
+		ast_log( LOG_NOTICE, " Voxlib device: %d\n", dev);
+		ast_log( LOG_NOTICE, "--------------------------\n");
+	}
+
+	/* ---------------------------- */
+	/* ----- Verbio Vcb stuff ----- */
+	/* ---------------------------- */
+
+	/* FIXME: voxlib bug that does not allow us to change 
+	   	  change ASR cfg and LANG on a specified dev.
+		  If we always use the same cfg... no problem.
+	*/
+	/* If we can not set asr config.. exit*/
+	if( vox_setparm( dev,VXCH_DEFASRCFG, asr_config) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set ASR config to %s. [%s]\n", asr_config, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+	
+	/* If we can not set asr lang.. exit*/
+	if( vox_setparm( dev,VXCH_DEFASRLANG, asr_lang) == -1)
+	{
+		ast_log( LOG_ERROR, "Can not set ASR lang to %s. [%s]\n", asr_lang, ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+	
+	if( builtin_grammar || vvi_grammar)
+	{
+		strcpy( gram_cache_full_path, gram_full_path);
+	}
+	else
+	{
+		/* Check if grammar is available in cache */
+		cache_grammar_exists = verbio_md5_grammar_exists( gram_full_path, gram_cache_full_path, asr_lang, option_verbose);
+	
+		if( cache_grammar_exists > 0)
+		{
+			/*
+				if( option_verbose > 0)
+				ast_log( LOG_NOTICE, "No need to prepare grammar %s (cache: %s).\n", gram_full_path, gram_cache_full_path);
+			*/
+		}
+		else
+		{
+			/* md5sum file created in verbio_md5_grammar_exists function */
+			if( option_verbose > 0)
+				ast_log( LOG_NOTICE, "Preparing grammar %s conf:%s lang:%s. Creating cache file: %s\n", 
+										gram_full_path, 
+										asr_config, 
+										asr_lang,
+										gram_cache_full_path);
+	
+			/* Prepare vocabulary */
+			if( vox_prevcbdev( dev, gram_cache_full_path, setmode, &nind, asr_lang) == -1) 
+			{
+				ast_log(LOG_ERROR, "Error preparing grammar [%s line: %d]\n", 
+								ATVOX_ERRMSGP( dev), nind);
+				ast_log(LOG_ERROR, "- grammar path: %s\n", gram_full_path);
+				ast_log(LOG_ERROR, "- cache grammar path: %s\n", gram_cache_full_path);
+				ast_log(LOG_ERROR, "vox_prevcbdev [%s line: %d]\n", ATVOX_ERRMSGP( -1), nind);
+				#if ASTERISK_VERSION_NUM < AST_4
+				LOCAL_USER_REMOVE( u);
+				#else	
+				ast_module_user_remove(u);
+				#endif
+				ast_config_destroy( vcfg);
+				if( option_no_hangup_on_verbio_err)
+					return 0;
+				else
+					return -1;
+			}
+		}
+	}
+	
+	/* Load vocabulary */
+	if( (vc_handle = vox_loadvcb( dev, gram_cache_full_path, setmode)) < 0) 
+	{
+		ast_log(LOG_ERROR, "vox_loadvcb [%s]\n", ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+	
+	/* Activate vocabulary */
+	if( vox_activatevcb( dev, vc_handle, setmode) < 0)
+	{
+		ast_log(LOG_ERROR, "vox_activatevcb [%s]\n", ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+
+	/* ---------------------------- */
+	/* ----- Set vcb chan var ----- */
+	/* ---------------------------- */
+	char tmpbuff [VERBIO_MAX_INT_SIZE];
+  	/*int size;*/
+	/*This (Asterisk) channel var will allow us to reference
+	this vocabulary (i.e on vocabulary unload)
+	*/
+	if( snprintf( tmpbuff, VERBIO_MAX_INT_SIZE, "%d",  vc_handle) > VERBIO_MAX_INT_SIZE)
+		ast_log( LOG_WARNING, "VVCB_HANDLE may be truncated.\n");
+  	pbx_builtin_setvar_helper( chan, "VVCB_HANDLE", tmpbuff);
+
+	if( option_verbose)
+		ast_log(LOG_NOTICE, "vc_handle %d\n", vc_handle);
+
+	ast_config_destroy( vcfg);
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove(u);
+	#endif
+
+	return 0;
+}
+
+/*! \brief Unload vocabulary. */
+static int verbio_unload_vcb( struct ast_channel *chan, DATA_TYPE data)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	int 		res = 0;
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 		localuser *u;
+	#else
+	struct 		ast_module_user *u;
+	#endif
+	int 		argc = 0;
+	char 		*argv[2];
+	struct ast_config *vcfg;
+	const char 	*tmp= NULL;
+	char 		*args = NULL;
+	/* Input Options */
+	char		*options 	= NULL;
+	char		*option_asr_config = NULL;
+	char 		*option_asr_lang = NULL;
+	char		*opt 	= NULL;
+	int		option_no_hangup_on_verbio_err = 0;
+	int 		option_verbose	= 0;
+	/* Cfg file options */
+	const char 	*vcfg_default_asr_config = NULL;
+	const char 	*vcfg_default_asr_lang = NULL;
+	int 		vcfg_verbose		= 0;
+	/* Options to be used when dealing with voxlib */
+	const char 	*vcfg_primary_host	= NULL;
+	const char 	*vcfg_backup_host	= NULL;
+	int 		dev 		= 0;
+	const char	*asr_config 	= NULL;
+	const char	*asr_lang 	= NULL;
+	int		vcb_handle	= 0;
+	
+
+	if( ast_strlen_zero( data)) 
+	{
+		ast_log( LOG_WARNING, "%s requires arguments (vcbhandle|[config]|[lang])\n",verbio_unload_vcb_app);
+		return -1;
+	}
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add( chan);
+	#endif
+	
+	args = ast_strdupa( data);	
+	if( !args) 
+	{
+		ast_log(LOG_ERROR, "Out of memory!\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+
+	if(( argc = ast_app_separate_args(args, args_sep, argv, sizeof(argv) / sizeof(argv[0])))) 
+	{
+		tmp = argv[0];
+		options = argv[1];
+	}
+
+ 	if( !ast_strlen_zero( tmp))
+	{
+		vcb_handle = atoi( tmp);
+	}
+	else
+	{
+		ast_log(LOG_ERROR, "Check input parameters.\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+
+		return -1;
+	}	
+
+	/* --------------------------------- */
+	/* ----- Get options from user ----- */
+	/* --------------------------------- */
+	/* <ASR config> */
+	option_asr_config = strsep(&options, str_sep);
+	if( option_asr_config)
+	{
+		if( !strcmp( option_asr_config, ""))
+			option_asr_config = NULL;
+	}
+	/* <ASR lang> */
+	option_asr_lang = strsep(&options, str_sep);
+	if( option_asr_lang)
+	{
+		if( !strcmp( option_asr_lang, ""))
+			option_asr_lang = NULL;
+	}
+	/* <Misc options> */
+	opt = strsep(&options, str_sep);	
+	if( opt) 
+	{
+		if( strchr( opt, 'n'))
+			option_no_hangup_on_verbio_err = 1;
+		if( strchr( opt, 'v'))
+			option_verbose = 1;
+	}
+
+	/* ----------------------------------------------- */
+	/* ----- Get options from Verbio config file ----- */
+	/* ----------------------------------------------- */
+	vcfg = verbio_load_asterisk_config();
+	if( !vcfg) 
+	{
+		ast_log(LOG_WARNING, "Error opening configuration file %s\n", VERBIO_CFG);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	if( !( vcfg_primary_host = ast_variable_retrieve(vcfg, "general", "primary_vox_server"))) 
+		vcfg_primary_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_backup_host = ast_variable_retrieve(vcfg, "general", "backup_vox_server"))) 	
+		vcfg_backup_host = VERBIO_DEF_HOST;
+	
+	if( !( vcfg_default_asr_config = ast_variable_retrieve(vcfg, "asr", "default_config"))) 
+		ast_log( LOG_WARNING, "Error reading default_config option\n");
+
+	if( !( vcfg_default_asr_lang = ast_variable_retrieve(vcfg, "asr", "default_language"))) 
+		ast_log( LOG_WARNING, "Error reading default_language option\n");
+
+	if( !( tmp = ast_variable_retrieve(vcfg, "debug", "verbose"))) 
+		tmp = "0";
+	vcfg_verbose = atoi( tmp);
+	if( vcfg_verbose)
+	{
+		ast_log( LOG_NOTICE, "Verbose enabled in config file.\n");
+		option_verbose = 1;
+	}
+
+	/* ---------------------------------------------------- */
+	/* ----- Set options (to be used on voxlib calls) ----- */
+	/* ---------------------------------------------------- */
+	/* <ASR config> */
+	if( !option_asr_config)
+		asr_config = vcfg_default_asr_config;
+	else
+		asr_config = option_asr_config;
+	/* <ASR lang> */
+	if( !option_asr_lang)
+		asr_lang = vcfg_default_asr_lang;
+	else	
+		asr_lang = option_asr_lang;
+	/* <dev value> */
+	dev = verbio_get_dev( chan, option_verbose);
+		
+	if( option_verbose)
+	{
+		ast_log( LOG_NOTICE, "------------------------------\n");
+		ast_log( LOG_NOTICE, "VerbioUnloadVcb param summary:\n");
+		ast_log( LOG_NOTICE, " Prim vox srv : %s\n", vcfg_primary_host);
+		ast_log( LOG_NOTICE, " Bckp vox srv : %s\n", vcfg_backup_host);
+		ast_log( LOG_NOTICE, " ASR config   : %s\n", asr_config);
+		ast_log( LOG_NOTICE, " ASR lang     :   %s\n", asr_lang);
+		ast_log( LOG_NOTICE, " Vcb handle   : %d\n", vcb_handle);
+		ast_log( LOG_NOTICE, " Voxlib device: %d\n", dev);
+		ast_log( LOG_NOTICE, "------------------------------\n");
+	}
+	
+	if( vcb_handle == -1)
+	{
+		if( vox_setvcb( dev, NULL, 0))/* Free licences */
+			ast_log( LOG_WARNING, "vox_setvcb. [%s]\n", ATVOX_ERRMSGP( dev));
+		
+		vox_devclose( dev); /* Free dev resources...otherwise we will run out of lines*/
+	}
+	else if( vox_unloadvcb( dev, vcb_handle, 0) < 0) 
+	{
+		ast_log( LOG_ERROR, "vox_unloadvcb. [%s]\n", ATVOX_ERRMSGP( dev));
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		ast_config_destroy( vcfg);
+		if( option_no_hangup_on_verbio_err)
+			return 0;
+		else
+			return -1;
+	}
+
+	ast_config_destroy( vcfg);
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove(u);
+	#endif
+
+	return res;
+}
+
+/*! \brief Print Verbio configuration info. */
+static int verbio_info( struct ast_channel *chan, DATA_TYPE data)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	/*
+		Testing purposes function.
+	*/
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 			localuser *u;
+	#else
+	struct 			ast_module_user *u;
+	#endif
+
+#if defined(__x86_64__)
+	unsigned int dwfilever, dwprodver;
+#else
+	unsigned long dwfilever, dwprodver;
+#endif
+	struct ast_config *vcfg;
+	const char *primary_host 	= NULL;
+	const char *backup_host 	= NULL;
+	const char *vcfg_net_timeout 	= NULL;
+	const char *tmp 		= NULL;
+	const char *default_tts_lang 	= NULL;
+	const char *default_tts_spkr 	= NULL;
+	const char *tts_txt_path 	= NULL;
+	const char *default_asr_config 	= NULL;
+	const char *default_asr_lang 	= NULL;
+	const char *asr_gram_path 	= NULL;
+	int max_sil			= 200;
+	int	waitres 		= -1;
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add( chan);
+	#endif
+	
+	vcfg = verbio_load_asterisk_config();
+	if( !vcfg) 
+	{
+		ast_log( LOG_WARNING, "Error opening configuration file %s\n", VERBIO_CFG);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove( u);
+		#endif
+		return -1;
+	}
+
+	vox_GetDllVersion(&dwfilever, &dwprodver);
+#if defined(__x86_64__)
+	ast_log( LOG_NOTICE, "Verbio %u.%02u\n", dwprodver>>16, dwprodver & 0xFFFF);
+#else
+	ast_log( LOG_NOTICE, "Verbio %lu.%02lu\n", dwprodver>>16, dwprodver & 0xFFFF);
+#endif
+	ast_log( LOG_NOTICE, "Serial_Number: %s\n", vox_SerialNumber());
+
+	if( !( primary_host = ast_variable_retrieve( vcfg, "general", "primary_vox_server"))) 
+		primary_host = VERBIO_DEF_HOST;
+	ast_log( LOG_NOTICE, "Primary Host: %s\n", primary_host);
+	
+	if( !( backup_host = ast_variable_retrieve( vcfg, "general", "backup_vox_server"))) 	
+		backup_host = VERBIO_DEF_HOST; 
+	ast_log( LOG_NOTICE, "Backup Host: %s\n", backup_host);
+
+	if( !( vcfg_net_timeout = ast_variable_retrieve( vcfg, "general", "net_timeout"))) 
+		vcfg_net_timeout = VERBIO_DEF_NET_TMOUT;
+	
+	ast_log( LOG_NOTICE, "Net timeout: %s\n", vcfg_net_timeout);
+
+	char *spkinfo;
+	if( vox_getparm(-1, VXGB_TTSSPKINFO, &spkinfo) == 0)
+	{
+		ast_log( LOG_NOTICE, "TTSSpeakers: %s\n", spkinfo);
+		pbx_builtin_setvar_helper( chan, "VTTS_SPEAKERS", spkinfo);
+	}
+
+	int playstrlic;
+	if( vox_getparm(-1, VXGB_PLAYSTRLIC, &playstrlic) == 0)
+		ast_log( LOG_NOTICE, "TTSlic: %d\n", playstrlic);
+
+	if( !( default_tts_lang = ast_variable_retrieve( vcfg, "tts", "default_language"))) 
+		default_tts_lang = "NOT_SET";
+	ast_log( LOG_NOTICE, "Default TTS lang: %s\n", default_tts_lang);
+	ast_log( LOG_NOTICE, "\t - licenses %d\n", vox_getttslic( default_tts_lang));
+
+	if( !( default_tts_spkr = ast_variable_retrieve( vcfg, "tts", "default_speaker"))) 
+		default_tts_spkr = "NOT_SET";
+	ast_log( LOG_NOTICE, "Default TTS speaker: %s\n", default_tts_spkr);
+	
+	if( !( tts_txt_path = ast_variable_retrieve( vcfg, "tts", "text_prompts_path"))) 
+		tts_txt_path = "NOT_SET";
+	ast_log( LOG_NOTICE, "Default TTS txt path: %s\n", tts_txt_path);
+	
+	char *asrconf;
+	if( vox_getparm(-1, VXGB_START_CONF, &asrconf) == 0)
+	{
+		ast_log( LOG_NOTICE, "ASRconfigs: %s\n", asrconf);
+		pbx_builtin_setvar_helper( chan, "VASR_CONFIGS", asrconf);
+	}
+
+	int recstrlic;
+	if( vox_getparm(-1, VXGB_RECSTRLIC, &recstrlic) == 0)
+		ast_log( LOG_NOTICE, "ASRlic: %d\n", recstrlic);
+
+	if( !( default_asr_config = ast_variable_retrieve( vcfg, "asr", "default_config"))) 
+		default_asr_config = "NOT_SET";
+	ast_log( LOG_NOTICE, "Default ASR config: %s\n", default_asr_config);
+	ast_log( LOG_NOTICE, "\t - licenses %d\n", vox_getasrlic( default_asr_config));
+	
+	if( !( default_asr_lang = ast_variable_retrieve( vcfg, "asr", "default_language"))) 
+		default_asr_lang = "NOT_SET";
+	ast_log( LOG_NOTICE, "Default ASR lang: %s\n", default_asr_lang);
+
+	if( !( asr_gram_path = ast_variable_retrieve( vcfg, "asr", "grammar_path"))) 
+		asr_gram_path = "NOT_SET";
+	ast_log( LOG_NOTICE, "Default ASR grammar path: %s\n", asr_gram_path);
+
+	if( !( tmp = ast_variable_retrieve( vcfg, "asr", "max_sil"))) 
+		tmp = VERBIO_MAX_SIL;
+	max_sil = atoi( tmp);
+	ast_log( LOG_NOTICE, "Max Sil: %d\n", max_sil);
+
+	ast_log( LOG_NOTICE, "Asterisk version: %d\n",ASTERISK_VERSION_NUM );
+
+
+	/* ----------------------------- */
+	/* Answer the channel (if not up)*/
+	/* ----------------------------- */
+	int res = 0;
+	if( chan->_state != AST_STATE_UP) 
+		res = ast_answer( chan);
+	
+	if( res) 
+	{
+		ast_log( LOG_WARNING, "Could not answer channel '%s'\n", chan->name);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove( u);
+		#endif
+		ast_config_destroy( vcfg);
+		return -1;
+	}
+
+	/* Print samples per frame info */
+	struct ast_frame *f;
+	int n = 0;
+	do
+	{	
+		waitres = ast_waitfor( chan, MAX_WAIT_TIME); 
+		if( waitres > -1)
+		{
+			if( waitres == 0)
+				continue;
+
+			f = ast_read( chan);
+			if( !f)
+			{
+				ast_log( LOG_NOTICE, "Hangup\n");
+				#if ASTERISK_VERSION_NUM < AST_4
+				LOCAL_USER_REMOVE( u);
+				#else	
+				ast_module_user_remove( u);
+				#endif
+				ast_config_destroy( vcfg);
+				return -1;
+			}
+			ast_log( LOG_NOTICE, "Samples per frame(%d): %d\n", n, f->samples);
+		}
+		++n;
+	}while( n < 4);
+	
+	ast_config_destroy( vcfg);
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove( u);
+	#endif
+
+
+	return 0;
+}
+
+/*! \brief Save last verbio error to channel var. */
+static int verbio_last_err( struct ast_channel *chan, DATA_TYPE data)
+{
+	/*
+		This function will check if there's any Verbio error
+		(will set an Asterisk chan var describing last occurred error) 
+	*/
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 			localuser *u;
+	#else
+	struct 			ast_module_user *u;
+	#endif
+	/* Input options */
+	char 			*var = NULL;
+	char 			*args;
+	int 			argc = 0;
+	char			*argv[1];
+	
+	if( ast_strlen_zero( data)) 
+	{
+		ast_log( LOG_ERROR, "%s requires an argument (var)\n",verbio_last_err_app);
+		return -1;
+	}
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add( chan);
+	#endif
+
+	/* We need to make a copy of the input string if we are going to modify it! */
+	args = ast_strdupa( data);	
+	if( !args) 
+	{
+		ast_log( LOG_ERROR, "Out of memory!\n");
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	
+	if(( argc = ast_app_separate_args( args, args_sep, argv, sizeof(argv) / sizeof(argv[0])))) 
+		var = argv[0];
+
+	verbio_set_err( chan, verbio_get_dev( chan, 0), var);
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove( u);
+	#endif
+
+
+	return 0;
+}
+
+/*! \brief Close verbio voxlib device. */
+static int verbio_free_channel( struct ast_channel *chan, DATA_TYPE data)
+{
+	ast_mutex_lock(&voxdownlock);
+	if( voxserver_is_down)
+	{ 
+		ast_log( LOG_ERROR, "Voxserver is down.\n"); 
+		ast_mutex_unlock(&voxdownlock); 
+		return 0;
+	}
+	ast_mutex_unlock(&voxdownlock);
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	struct 			localuser *u;
+	#else
+	struct 			ast_module_user *u;
+	#endif
+	int dev = verbio_get_dev( chan, 0);
+	struct ast_config *vcfg;
+	int dev_id = 0;
+	int i = 0;
+	const char 		*vtmp = NULL;
+	char 			*tmp = NULL;
+	char 			*args;
+	int 			argc = 0;
+	char			*argv[1];
+	int			vcfg_verbose = 0;
+
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_ADD( u);
+	#else
+	u = ast_module_user_add( chan);
+	#endif
+
+	if( !ast_strlen_zero( data)) 
+	{
+		args = ast_strdupa( data);	
+		if( !args) 
+		{
+			ast_log(LOG_ERROR, "Out of memory!\n");
+			#if ASTERISK_VERSION_NUM < AST_4
+			LOCAL_USER_REMOVE( u);
+			#else	
+			ast_module_user_remove(u);
+			#endif
+			return -1;
+		}
+	
+		if(( argc = ast_app_separate_args(args, args_sep, argv, sizeof(argv) / sizeof(argv[0])))) 
+			tmp = argv[0];
+	
+		if( !ast_strlen_zero( tmp))
+			dev_id = atoi( tmp);
+	}
+	
+	vcfg = verbio_load_asterisk_config();
+	if( !vcfg) 
+	{
+		ast_log(LOG_WARNING, "Error opening configuration file %s\n", VERBIO_CFG);
+		#if ASTERISK_VERSION_NUM < AST_4
+		LOCAL_USER_REMOVE( u);
+		#else	
+		ast_module_user_remove(u);
+		#endif
+		return -1;
+	}
+	
+	if( !( vtmp = ast_variable_retrieve(vcfg, "debug", "verbose"))) 
+		vtmp = "0";
+	
+	vcfg_verbose = atoi( vtmp);
+	
+	if( vcfg_verbose)
+		ast_log( LOG_NOTICE, "vox_devclose %d\n", dev);
+
+	/*TODO: vox_thclose() ?*/
+
+	if( dev_id == -1)
+	{	
+		/* Free all possible channels */
+		ast_log( LOG_WARNING, "Closing all devices! (may be slow)\n");
+		for( i = 0; i < dev; ++i)
+		{
+			ast_log( LOG_NOTICE, "vox_devclose %d of %d \n", i, dev);
+			if (vox_devclose( i) < 0)
+			{
+				ast_log( LOG_WARNING, "vox_devclose( %d/%d). [%s]\n", i, dev, ATVOX_ERRMSGP( dev));
+			}
+		}
+	}
+	else if( vox_devclose( dev) < 0)
+	{
+		ast_log( LOG_ERROR, "vox_devclose. [%s]\n", ATVOX_ERRMSGP( dev));
+	}
+
+	ast_config_destroy( vcfg);
+	
+	#if ASTERISK_VERSION_NUM < AST_4
+	LOCAL_USER_REMOVE( u);
+	#else	
+	ast_module_user_remove( u);
+	#endif
+
+
+	return 0;
+}
+
+#if ASTERISK_VERSION_NUM < AST_4
+int unload_module( void)
+#else	
+static int unload_module( void)
+#endif
+{
+	int res = 0;
+	
+	ast_mutex_lock(&unloadingmodlock);
+	unloading_module = 1;
+	ast_mutex_unlock(&unloadingmodlock);
+	
+	while( 1)
+	{
+		sleep(1);
+		ast_mutex_lock(&reconnectlock);
+		if( !trying_to_reconnect)
+		{ast_mutex_unlock(&reconnectlock); break;}
+		ast_mutex_unlock(&reconnectlock);
+	}
+	
+	/* Close connection with voxserver */
+	close_verbio();
+	
+	res = ast_unregister_application( verbio_load_vcb_app);
+	res |= ast_unregister_application( verbio_unload_vcb_app);
+	res |= ast_unregister_application( verbio_rec_app);
+	res |= ast_unregister_application( verbio_stream_and_rec_app);
+	res |= ast_unregister_application( verbio_prompt_and_rec_app);
+	res |= ast_unregister_application( verbio_prompt_app);
+	
+	res |= ast_unregister_application( verbio_info_app);
+	res |= ast_unregister_application( verbio_last_err_app);
+	res |= ast_unregister_application( verbio_free_channel_app);
+
+ 	#if ASTERISK_VERSION_NUM < AST_4
+ 	STANDARD_HANGUP_LOCALUSERS;
+ 	#elif ASTERISK_VERSION_NUM < AST_6
+ 	ast_module_user_hangup_all();
+	#else
+	/* */
+ 	#endif
+	
+	ast_mutex_destroy( &voxdownlock);
+	ast_mutex_destroy( &reconnectlock);
+	ast_mutex_destroy( &unloadingmodlock);
+	
+	return res;	
+}
+
+#if ASTERISK_VERSION_NUM < AST_4
+int load_module( void)
+#else	
+static int load_module( void)
+#endif
+{
+	int res = 0;
+
+	ast_mutex_init( &voxdownlock);
+	ast_mutex_init( &reconnectlock);
+	ast_mutex_init( &unloadingmodlock);
+	
+/*
+	init_verbio()
+		-1 - Something went wrong
+		0 - ASR and TTS
+		1 - ASR
+		2 - TTS
+*/
+	/* TODO: add verbio_register_asr_apps, verbio_register_tts_apps, 
+				verbio_register_asrtts_apps functions*/
+	int avres = init_verbio();
+
+#if 0
+	if( avres != -1)
+	{ 
+		/* Now whe are sure that the voxserver is up again
+		   reconnect in order to avoid partial connection 
+		   (i.e: voxserver went up after ASR reconnect)
+		*/
+		close_verbio();
+		avres = init_verbio();
+	}
+#endif
+
+	if( avres != -1)
+	{
+		/* Load applications that are not ASR/TTS dependent */
+		res  = ast_register_application( verbio_info_app, verbio_info, "Print some (maybe useful) Info", verbio_info_descrip);
+		res |= ast_register_application( verbio_last_err_app, verbio_last_err, "Get Verbio last error", verbio_last_err_descrip);
+		res |= ast_register_application( verbio_free_channel_app, verbio_free_channel, "Free verbio resources", verbio_free_channel_descrip);
+
+//DELETED: 2017-03-28
+//		if( avres == 0) /*ASR and TTS*/
+//		{
+//DELETED: 2017-03-28
+			/* Register ASR and TTS related apps */
+			res |= ast_register_application( verbio_load_vcb_app, verbio_load_vcb, "Load vocabulary", verbio_load_vcb_descrip);
+			res |= ast_register_application( verbio_unload_vcb_app, verbio_unload_vcb, "Unload vocabulary", verbio_unload_vcb_descrip);
+			res |= ast_register_application( verbio_rec_app, verbio_rec, "Recognize application", verbio_rec_descrip);
+			res |= ast_register_application( verbio_stream_and_rec_app, verbio_stream_and_rec, "Stream and recognize application", verbio_stream_and_rec_descrip);
+			res |= ast_register_application( verbio_prompt_and_rec_app, verbio_prompt_and_rec, "Launch synthesis and recognition", verbio_prompt_and_rec_descrip);
+			res |= ast_register_application( verbio_prompt_app, verbio_prompt, "Text to speech application", verbio_prompt_descrip);
+//DELETED: 2017-03-28
+//		}
+//		else if( avres == 1) /* Only ASR */
+//		{
+//			/* Register ASR related apps */
+//			res |= ast_register_application( verbio_load_vcb_app, verbio_load_vcb, "Load vocabulary", verbio_load_vcb_descrip);
+//			res |= ast_register_application( verbio_unload_vcb_app, verbio_unload_vcb, "Unload vocabulary", verbio_unload_vcb_descrip);
+//			res |= ast_register_application( verbio_rec_app, verbio_rec, "Recognize application", verbio_rec_descrip);
+//			res |= ast_register_application( verbio_stream_and_rec_app, verbio_stream_and_rec, "Stream and recognize application", verbio_stream_and_rec_descrip);
+//		}
+//		else if( avres == 2) /* Only TTS */
+//		{
+//			/* Register TTS related apps */
+//			res |= ast_register_application( verbio_prompt_app, verbio_prompt, "Text to speech application", verbio_prompt_descrip);
+//		}
+//DELETED: 2017-03-28
+	}
+	else
+	{
+		ast_log( LOG_ERROR, "Error initing verbio. Please check that /etc/asterisk/verbio.conf is properly configured,\nand your voxserver is up and running.");
+//ADDED: 2017-03-28
+		return AST_MODULE_LOAD_DECLINE;
+//ADDED: 2017-03-28
+	}
+
+//DELETED: 2017-03-28
+//	return res;
+//DELETED: 2017-03-28
+//ADDED: 2017-03-28
+	return res ? AST_MODULE_LOAD_DECLINE : 0;
+//ADDED: 2017-03-28
+}
+ 
+#if ASTERISK_VERSION_NUM < AST_4
+int usecount( void)
+{
+ 	int res;
+ 	STANDARD_USECOUNT(res);
+ 	return res;
+}
+
+char *key()
+{
+	return ASTERISK_GPL_KEY;
+}
+
+char *description( void)
+{
+ 	return tdesc;
+}
+#endif
+
+#if ASTERISK_VERSION_NUM < AST_4
+/*AST_MODULE_INFO_STANDARD(ASTERISK_GPL_KEY, "Verbio Speech Technologies Applications");*/
+#else
+AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "Verbio Speech Technologies Applications",
+		.load = load_module,
+		.unload = unload_module,
+	       );
+#endif
+/*verbio-asterisk-4.0*/
+

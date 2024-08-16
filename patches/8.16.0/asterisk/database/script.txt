@@ -1,0 +1,172 @@
+-- Table: queue_table
+
+-- DROP TABLE queue_table;
+
+CREATE TABLE queue_table
+(
+  name varchar(80) NOT NULL,
+  musiconhold varchar(80),
+  announce varchar(80),
+  context varchar(80),
+  timeout int8,
+  ringinuse varchar(10),
+  setinterfacevar varchar(10),
+  monitor_join varchar(10),
+  monitor_format varchar(8),
+  queue_youarenext varchar(80),
+  queue_thereare varchar(80),
+  queue_callswaiting varchar(80),
+  queue_holdtime varchar(80),
+  queue_minutes varchar(80),
+  queue_seconds varchar(80),
+  queue_lessthan varchar(80),
+  queue_thankyou varchar(80),
+  queue_reporthold varchar(80),
+  announce_frequency int8,
+  announce_round_seconds int8,
+  announce_holdtime varchar(80),
+  periodic_announce varchar(80),
+  periodic_announce_frequency int8,
+  retry int8,
+  wrapuptime int8,
+  autofill varchar(10),
+  monitor_type varchar(80),
+  autopause varchar(10),
+  maxlen int8,
+  servicelevel int8,
+  strategy varchar(80),
+  joinempty varchar(128),
+  leavewhenempty varchar(10),
+  eventmemberstatus varchar(10),
+  eventwhencalled varchar(10),
+  reportholdtime varchar(10),
+  memberdelay int8,
+  weight int8,
+  timeoutrestart varchar(10),
+  CONSTRAINT queue_table_pkey PRIMARY KEY (name)
+);
+ALTER TABLE queue_table OWNER TO postgres;
+
+-- Table: queue_member_table
+
+-- DROP TABLE queue_member_table;
+
+CREATE TABLE queue_member_table
+(
+  queue_name varchar(80) NOT NULL,
+  interface varchar(80) NOT NULL,
+  penalty int8,
+  paused int8,
+  CONSTRAINT queue_member_table_pkey PRIMARY KEY (queue_name, interface)
+);
+ALTER TABLE queue_member_table OWNER TO postgres;
+
+ALTER TABLE queue_member_table ADD COLUMN uniqueid serial NOT NULL;
+
+ALTER SEQUENCE queue_member_table_uniqueid_seq
+  INCREMENT 1
+  MINVALUE 1
+  MAXVALUE 2147483647
+  START 1
+  CACHE 1
+  CYCLE;
+ALTER TABLE queue_member_table_uniqueid_seq
+  OWNER TO postgres;
+
+-- Table: sip_conf
+
+-- DROP TABLE sip_conf;
+
+CREATE TABLE sip_conf
+(
+  id serial NOT NULL,
+  auth varchar(50),
+  callerid varchar(50),
+  callingpres varchar(40) DEFAULT 'allowed_not_screened'::character varying,
+  "call-limit" int8 DEFAULT 1,
+  canreinvite varchar(3) DEFAULT 'no'::character varying,
+  context varchar(50),
+  defaultip varchar(15),
+  deny varchar(100),
+  permit varchar(100),
+  disallow varchar(100) DEFAULT 'all'::character varying,
+  allow varchar(100) DEFAULT 'ulaw;alaw;g729'::character varying,
+  dtmfmode varchar(7),
+  fromdomain varchar(100),
+  fromuser varchar(100),
+  fullcontact varchar(100),
+  host varchar(50) NOT NULL DEFAULT ''::character varying,
+  insecure varchar(20),
+  ipaddr varchar(15) NOT NULL DEFAULT ''::character varying,
+  "language" varchar(2),
+  mailbox varchar(50),
+  md5secret varchar(100),
+  musiconhold varchar(100),
+  name varchar(100) NOT NULL DEFAULT ''::character varying,
+  nat varchar(5) NOT NULL DEFAULT 'no'::character varying,
+  port varchar(5) NOT NULL DEFAULT ''::character varying,
+  qualify varchar(3),
+  regseconds bigint NOT NULL DEFAULT 0,
+  rtpkeepalive int8 NOT NULL DEFAULT 0,
+  rtptimeout int8 NOT NULL DEFAULT 0,
+  rtpholdtimeout int8 NOT NULL DEFAULT 0,
+  secret varchar(100),
+  sendrpid varchar(3) DEFAULT 'no'::character varying,
+  "type" varchar(10) NOT NULL DEFAULT 'friend'::character varying,
+  username varchar(100) NOT NULL DEFAULT ''::character varying,
+  trustrpid varchar(3),
+  lastms integer
+);
+ALTER TABLE sip_conf OWNER TO postgres;
+
+-- Table: iax2_conf
+
+-- DROP TABLE iax2_conf;
+
+CREATE TABLE iax2_conf
+(
+  id serial NOT NULL,
+  auth varchar(50),
+  callerid varchar(50),
+  context varchar(50),
+  defaultip varchar(15),
+  deny varchar(100),
+  permit varchar(100),
+  disallow varchar(100) DEFAULT 'all'::character varying,
+  allow varchar(100) DEFAULT 'ulaw;alaw;g729'::character varying,
+  fullcontact varchar(100),
+  host varchar(50) NOT NULL DEFAULT ''::character varying,
+  ipaddr varchar(15) NOT NULL DEFAULT ''::character varying,
+  "language" varchar(2),
+  mailbox varchar(50),
+  md5secret varchar(100),
+  mohinterpret varchar(100),
+  name varchar(100) NOT NULL DEFAULT ''::character varying,
+  port varchar(5) NOT NULL DEFAULT ''::character varying,
+  qualify varchar(3),
+  regseconds bigint NOT NULL DEFAULT 0,
+  secret varchar(100),
+  tos varchar(10),
+  transfer varchar(10),
+  "type" varchar(10) NOT NULL DEFAULT 'friend'::character varying,
+  username varchar(100) NOT NULL DEFAULT ''::character varying
+);
+ALTER TABLE iax2_conf OWNER TO postgres;
+
+-- Table: voicemail_users
+
+-- DROP TABLE voicemail_users;
+
+CREATE TABLE voicemail_users
+(
+  id serial NOT NULL,
+  customer_id int8 NOT NULL DEFAULT (0)::bigint,
+  context varchar(50) NOT NULL DEFAULT ''::character varying,
+  mailbox int8 NOT NULL DEFAULT (0)::bigint,
+  "password" varchar(4) NOT NULL DEFAULT '0'::character varying,
+  fullname varchar(50) NOT NULL DEFAULT ''::character varying,
+  email varchar(50) NOT NULL DEFAULT ''::character varying,
+  pager varchar(50) NOT NULL DEFAULT ''::character varying,
+  stamp timestamp(6) NOT NULL
+);
+ALTER TABLE voicemail_users OWNER TO postgres;
