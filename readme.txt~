@@ -11,5 +11,6 @@ cd /usr/src/PBX-1.8-RL94/scripts
 ./asterisk_install.sh
 ./patch_8.16.0.sh
 ./patch_8.16.1.sh
-./patch_8.16.2.sh
+#./patch_8.16.2.sh no sirve
 ./patch_8.16.3.sh
+./patch_8.16.4.sh
